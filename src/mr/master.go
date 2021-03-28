@@ -1,6 +1,9 @@
 package mr
 
-import "log"
+import (
+	"log"
+	"os"
+)
 import "net"
 import "net/rpc"
 import "net/http"
@@ -30,10 +33,10 @@ func (m *Master) Example(args *ExampleArgs, reply *ExampleReply) error {
 func (m *Master) server() {
 	rpc.Register(m)
 	rpc.HandleHTTP()
-	l, e := net.Listen("tcp", ":1234")
-	//sockname := masterSock()
-	//os.Remove(sockname)
-	//l, e := net.Listen("unix", sockname)
+	//l, e := net.Listen("tcp", ":1234")
+	sockname := masterSock()
+	os.Remove(sockname)
+	l, e := net.Listen("unix", sockname)
 	if e != nil {
 		log.Fatal("listen error:", e)
 	}
