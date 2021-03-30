@@ -28,8 +28,9 @@ type Args struct {
 }
 
 type Reply struct {
-	filename string
-	content string
+	Filename string
+	Content string
+	Job string
 }
 
 // Cook up a unique-ish UNIX-domain socket name

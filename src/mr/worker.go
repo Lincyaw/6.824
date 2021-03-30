@@ -40,12 +40,16 @@ func Worker(mapf func(string, string) []KeyValue,
 
 	// send the RPC request, wait for the reply.
 	call("Master.Example", &args, &reply)
+	var ans []KeyValue
+	if reply.Job == "map" {
+		fmt.Println(reply)
+		ans = mapf(reply.Filename, reply.Content)
+	} else {
+		// TODO
+	}
 
-	// reply.Y should be 100.
-	fmt.Printf("reply.content %v\n", reply.filename)
-	// uncomment to send the Example RPC to the master.
+	fmt.Printf("reply.content %v\n", reply.Filename)
 	//CallExample()
-
 }
 
 //
