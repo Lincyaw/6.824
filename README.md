@@ -63,3 +63,10 @@ hint里说
 根据hint的说法，在map工作结束后，他会把中间结果写到本地文件中，命名为mr-X-Y的格式。X是map任务的id，Y
 是reduce任务的id，这说明在分配map时，实际上就决定了reduce的任务是谁的。（并不是很确定这种说法）
 
+---
+实际上不需要考虑我上面说的`怎么提前分配reduce工作？`这个问题。
+
+分配到reduce的worker只需要接受一个index即可。这个index表示他需要处理哪一个reduce工作。
+拿nReduce=10作为一个例子的话，master会给10个worker分配reduce工作。给他们发的index分别是0,1,2,...,9
+
+拿到reduce工作的worker需要去找所有为mr-x-index格式的文件，将其统计即可。其中x是变量。

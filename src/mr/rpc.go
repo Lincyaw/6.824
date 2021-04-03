@@ -24,15 +24,26 @@ type ExampleReply struct {
 
 // Add your RPC definitions here.
 type Args struct {
-	X int
+	WorkerId string
 }
 
 type Reply struct {
+	// 文件名（实际上并没有用到这个参数
 	Filename string
-	Content string
-	Job string
-	NReduce int
-	Number int
+	// 文件的内容
+	Content  string
+	// 任务，判断是map还是reduce
+	Job      string
+	// 一共有几个reduce任务
+	NReduce  int
+	// 一共有几个map任务
+	NMap int
+	// 当前是哪一个任务
+	Id       int
+}
+
+type Work struct {
+
 }
 
 // Cook up a unique-ish UNIX-domain socket name

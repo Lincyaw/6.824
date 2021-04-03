@@ -1,7 +1,6 @@
 package mr
 
 import (
-	"fmt"
 	"io/ioutil"
 	"log"
 	"os"
@@ -12,9 +11,11 @@ import "net/http"
 
 type Master struct {
 	// Your definitions here.
-	files   []string
-	nWorker []bool
-	nReduce int
+	files      []string
+	nWorker    []bool
+	nReduce    int
+	reduceWork []bool
+	done bool
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -25,9 +26,10 @@ type Master struct {
 // the RPC argument and reply types are defined in rpc.go.
 //
 func (m *Master) Example(args *Args, reply *Reply) error {
-	fmt.Println(m.files)
-	for i:=range m.nWorker{
-		if m.nWorker[i] == false{
+	//fmt.Println(m.files)
+	log.Println("taskId: ",args.WorkerId)
+	for i := range m.nWorker {
+		if m.nWorker[i] == false {
 			reply.Filename = m.files[i]
 
 			file, err := os.Open(reply.Filename)
@@ -40,17 +42,28 @@ func (m *Master) Example(args *Args, reply *Reply) error {
 			}
 			reply.Content = string(content)
 			reply.Job = "map"
-			reply.Number = i
+			reply.Id = i
 			reply.NReduce = m.nReduce
 			m.nWorker[i] = true
 			err = file.Close()
 			if err != nil {
 				log.Fatalf("close file error %v", reply.Filename)
 			}
-			break
+			return nil
 		}
 	}
 
+	for k := 0; k < m.nReduce; k++ {
+		if m.reduceWork[k] == false {
+			m.reduceWork[k] = true
+			reply.Job = "reduce"
+			reply.Id = k
+			reply.NMap = len(m.files)
+			reply.NReduce = m.nReduce
+			return nil
+		}
+	}
+	m.done = true
 	return nil
 }
 
@@ -75,11 +88,11 @@ func (m *Master) server() {
 // if the entire job has finished.
 //
 func (m *Master) Done() bool {
-	ret := false
+	//ret := false
 
 	// Your code here.
 
-	return ret
+	return m.done
 }
 
 //
@@ -89,13 +102,17 @@ func (m *Master) Done() bool {
 //
 func MakeMaster(files []string, nReduce int) *Master {
 	m := Master{}
-
+	log.Println(files)
 	// Your code here.
 	m.files = files
 	m.nReduce = nReduce
-	m.nWorker = make([]bool, nReduce)
+	m.nWorker = make([]bool, len(files))
+	m.reduceWork = make([]bool, nReduce)
 	for i := range m.nWorker {
 		m.nWorker[i] = false
+	}
+	for i := range m.reduceWork {
+		m.reduceWork[i] = false
 	}
 	m.server()
 	return &m

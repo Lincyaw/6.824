@@ -1,9 +1,13 @@
 package mr
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
+	"strconv"
+	"time"
 )
 import "log"
 import "net/rpc"
@@ -16,7 +20,13 @@ type KeyValue struct {
 	Key   string
 	Value string
 }
+// for sorting by key.
+type ByKey []KeyValue
 
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 //
 // use ihash(key) % NReduce to choose the reduce
 // task number for each KeyValue emitted by Map.
@@ -26,7 +36,19 @@ func ihash(key string) int {
 	h.Write([]byte(key))
 	return int(h.Sum32() & 0x7fffffff)
 }
+func genWorkerID() (uuid string) {
+	// generate 32 bits timestamp
+	unix32bits := uint32(time.Now().UTC().Unix())
 
+	buff := make([]byte, 12)
+
+	numRead, err := rand.Read(buff)
+
+	if numRead != len(buff) || err != nil {
+		panic(err)
+	}
+	return fmt.Sprintf("%x-%x-%x-%x-%x-%x\n", unix32bits, buff[0:2], buff[2:4], buff[4:6], buff[6:8], buff[8:])
+}
 //
 // main/mrworker.go calls this function.
 //
@@ -38,14 +60,13 @@ func Worker(mapf func(string, string) []KeyValue,
 	args := Args{}
 
 	// fill in the argument(s).
-	args.X = 99
+	args.WorkerId = genWorkerID()
 	// declare a reply structure.
 	reply := Reply{}
 
 	// send the RPC request, wait for the reply.
 	call("Master.Example", &args, &reply)
 	if reply.Job == "map" {
-		//fmt.Println(reply)
 		mapf(reply.Filename, reply.Content)
 		kvs := mapf(reply.Filename, reply.Content)
 		// 二维的kv, 即 nReduce 个桶
@@ -56,7 +77,7 @@ func Worker(mapf func(string, string) []KeyValue,
 			reduces[idx] = append(reduces[idx], kv)
 		}
 		for idx, reduce := range reduces {
-			file := fmt.Sprintf("mr-%d-%d", reply.Number, idx)
+			file := fmt.Sprintf("mr-%d-%d", reply.Id, idx)
 			_, err := os.Stat(file)
 			var f *os.File
 			if os.IsExist(err) {
@@ -75,11 +96,50 @@ func Worker(mapf func(string, string) []KeyValue,
 				}
 			}
 		}
+		log.Println("Map execute succeed")
 	} else {
-		// TODO
+		var intermediate []KeyValue
+		for n:=0;n<reply.NMap;n++{
+			fileName := "mr-"+strconv.Itoa(n)+"-"+strconv.Itoa(reply.Id)
+			f, err := os.Open(fileName)
+			if err!=nil{
+				fmt.Println("unable to read ", fileName)
+			}
+			defer f.Close()
+			decoder := json.NewDecoder(f)
+			var kv KeyValue
+			for decoder.More()  {
+				if err:=decoder.Decode(&kv); err != nil{
+					log.Println("Json decode failed, ",err)
+				}
+				intermediate = append(intermediate,kv)
+			}
+		}
+		sort.Sort(ByKey(intermediate))
+		i:=0
+		ofile, err := os.Create("mr-out-"+strconv.Itoa(reply.Id+1))
+		if err!=nil{
+			log.Println("Unable to create file, ",err)
+		}
+		defer ofile.Close()
+		for i < len(intermediate) {
+			j := i + 1
+			for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+				j++
+			}
+			values := []string{}
+			for k := i; k < j; k++ {
+				values = append(values, intermediate[k].Value)
+			}
+			output := reducef(intermediate[i].Key, values)
+
+			// this is the correct format for each line of Reduce output.
+			fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+
+			i = j
+		}
+		log.Println("Reduce execute succeed")
 	}
-	//fmt.Println(ans)
-	fmt.Printf("reply.content: %v\n", reply.Filename)
 }
 
 //
