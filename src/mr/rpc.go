@@ -31,6 +31,8 @@ type Reply struct {
 	Filename string
 	Content string
 	Job string
+	NReduce int
+	Number int
 }
 
 // Cook up a unique-ish UNIX-domain socket name

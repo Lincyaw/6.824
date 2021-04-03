@@ -40,6 +40,13 @@ func (m *Master) Example(args *Args, reply *Reply) error {
 			}
 			reply.Content = string(content)
 			reply.Job = "map"
+			reply.Number = i
+			reply.NReduce = m.nReduce
+			m.nWorker[i] = true
+			err = file.Close()
+			if err != nil {
+				log.Fatalf("close file error %v", reply.Filename)
+			}
 			break
 		}
 	}

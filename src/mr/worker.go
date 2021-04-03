@@ -1,6 +1,10 @@
 package mr
 
-import "fmt"
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+)
 import "log"
 import "net/rpc"
 import "hash/fnv"
@@ -40,16 +44,42 @@ func Worker(mapf func(string, string) []KeyValue,
 
 	// send the RPC request, wait for the reply.
 	call("Master.Example", &args, &reply)
-	var ans []KeyValue
 	if reply.Job == "map" {
-		fmt.Println(reply)
-		ans = mapf(reply.Filename, reply.Content)
+		//fmt.Println(reply)
+		mapf(reply.Filename, reply.Content)
+		kvs := mapf(reply.Filename, reply.Content)
+		// 二维的kv, 即 nReduce 个桶
+		reduces := make([][]KeyValue, reply.NReduce)
+		// 将结果分到 nReduce 个桶中
+		for _, kv := range kvs {
+			idx := ihash(kv.Key) % reply.NReduce
+			reduces[idx] = append(reduces[idx], kv)
+		}
+		for idx, reduce := range reduces {
+			file := fmt.Sprintf("mr-%d-%d", reply.Number, idx)
+			_, err := os.Stat(file)
+			var f *os.File
+			if os.IsExist(err) {
+				if f, err = os.Open(file); err != nil {
+					fmt.Println(err)
+				}
+			} else {
+				if f, err = os.Create(file); err != nil {
+					fmt.Println(err)
+				}
+			}
+			enc := json.NewEncoder(f)
+			for _, kv := range reduce {
+				if err := enc.Encode(&kv); err != nil {
+					fmt.Println("error in encode")
+				}
+			}
+		}
 	} else {
 		// TODO
 	}
-
-	fmt.Printf("reply.content %v\n", reply.Filename)
-	//CallExample()
+	//fmt.Println(ans)
+	fmt.Printf("reply.content: %v\n", reply.Filename)
 }
 
 //
