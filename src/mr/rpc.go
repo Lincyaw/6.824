@@ -13,6 +13,13 @@ import "strconv"
 // example to show how to declare the arguments
 // and reply for an RPC.
 //
+type TaskStatus int
+
+const (
+	NotStarted TaskStatus = 0
+	InTheMid   TaskStatus = 1
+	Finish     TaskStatus = 2
+)
 
 type ExampleArgs struct {
 	X int
@@ -28,22 +35,26 @@ type Args struct {
 }
 
 type Reply struct {
+	// 是否有任务
+	Valid bool
 	// 文件名（实际上并没有用到这个参数
 	Filename string
 	// 文件的内容
-	Content  string
+	Content string
 	// 任务，判断是map还是reduce
-	Job      string
+	WorkType string
 	// 一共有几个reduce任务
-	NReduce  int
+	NReduce int
 	// 一共有几个map任务
 	NMap int
 	// 当前是哪一个任务
-	Id       int
+	Id int
 }
 
-type Work struct {
-
+type WorkStatus struct {
+	WorkerId string
+	WorkType string
+	Done     bool
 }
 
 // Cook up a unique-ish UNIX-domain socket name

@@ -10,12 +10,52 @@ import "net/rpc"
 import "net/http"
 
 type Master struct {
-	// Your definitions here.
-	files      []string
-	nWorker    []bool
-	nReduce    int
-	reduceWork []bool
+	// 要处理哪些文件
+	files []string
+	// 对应的这些文件工作的状态
+	nWorker []TaskStatus
+	// 要有几个reduce工作
+	nReduce int
+	// 对应的这几个reduce工作是否完成
+	reduceWork []TaskStatus
+	// 所有工作都完成了吗
 	done bool
+
+	taskMap map[string]int
+}
+
+func (m *Master) ReceiveStatus(args *WorkStatus, reply *Reply) error {
+	if args.WorkType == "map" {
+		if args.Done {
+			m.nWorker[m.taskMap[args.WorkerId]] = Finish
+			log.Println("Map", m.taskMap[args.WorkerId], "finished")
+		} else {
+			// 归零
+			m.nWorker[m.taskMap[args.WorkerId]] = NotStarted
+			log.Println("Map", m.taskMap[args.WorkerId], "failed")
+		}
+	} else {
+		if args.Done {
+			m.reduceWork[m.taskMap[args.WorkerId]] = Finish
+			log.Println("Reduce", m.taskMap[args.WorkerId], "finished")
+		} else {
+			// 归零
+			m.reduceWork[m.taskMap[args.WorkerId]] = NotStarted
+			log.Println("Reduce", m.taskMap[args.WorkerId], "failed")
+		}
+	}
+	for i := range m.nWorker {
+		if m.nWorker[i] != Finish {
+			return nil
+		}
+	}
+	for i := range m.reduceWork{
+		if m.reduceWork[i] != Finish{
+			return nil
+		}
+	}
+	m.done = true
+	return nil
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -25,11 +65,11 @@ type Master struct {
 //
 // the RPC argument and reply types are defined in rpc.go.
 //
-func (m *Master) Example(args *Args, reply *Reply) error {
-	//fmt.Println(m.files)
-	log.Println("taskId: ",args.WorkerId)
+func (m *Master) SendTask(args *Args, reply *Reply) error {
+	log.Println("taskId: ", args.WorkerId)
+	// 每次调用这个函数，只分配一个任务
 	for i := range m.nWorker {
-		if m.nWorker[i] == false {
+		if m.nWorker[i] == NotStarted {
 			reply.Filename = m.files[i]
 
 			file, err := os.Open(reply.Filename)
@@ -40,30 +80,40 @@ func (m *Master) Example(args *Args, reply *Reply) error {
 			if err != nil {
 				log.Fatalf("cannot read %v", reply.Filename)
 			}
+			// 将id和对应的任务映射起来
+			m.taskMap[args.WorkerId] = i
+
 			reply.Content = string(content)
-			reply.Job = "map"
+			reply.WorkType = "map"
 			reply.Id = i
 			reply.NReduce = m.nReduce
-			m.nWorker[i] = true
-			err = file.Close()
-			if err != nil {
+			reply.Valid = true
+			if err := file.Close(); err != nil {
 				log.Fatalf("close file error %v", reply.Filename)
 			}
+			m.nWorker[i] = InTheMid
+			log.Println("Map", i, "send out")
+
+			// todo：发射一个定时器，来检查 10 秒后任务是否完成，否则就任务这个 worker 挂掉了
 			return nil
 		}
 	}
-
+	// 如果到这一步，说明map任务都发送出去了
 	for k := 0; k < m.nReduce; k++ {
-		if m.reduceWork[k] == false {
-			m.reduceWork[k] = true
-			reply.Job = "reduce"
+		if m.reduceWork[k] == NotStarted {
+			m.taskMap[args.WorkerId] = k
+			reply.Valid = true
+			reply.WorkType = "reduce"
 			reply.Id = k
 			reply.NMap = len(m.files)
 			reply.NReduce = m.nReduce
+			m.reduceWork[k] = InTheMid
+			log.Println("Reduce", k, "send out")
 			return nil
 		}
 	}
-	m.done = true
+	log.Println("All Done!!!!!!!!")
+	reply.Valid = false
 	return nil
 }
 
@@ -106,13 +156,14 @@ func MakeMaster(files []string, nReduce int) *Master {
 	// Your code here.
 	m.files = files
 	m.nReduce = nReduce
-	m.nWorker = make([]bool, len(files))
-	m.reduceWork = make([]bool, nReduce)
+	m.nWorker = make([]TaskStatus, len(files))
+	m.reduceWork = make([]TaskStatus, nReduce)
+	m.taskMap = make(map[string]int)
 	for i := range m.nWorker {
-		m.nWorker[i] = false
+		m.nWorker[i] = NotStarted
 	}
 	for i := range m.reduceWork {
-		m.reduceWork[i] = false
+		m.reduceWork[i] = NotStarted
 	}
 	m.server()
 	return &m

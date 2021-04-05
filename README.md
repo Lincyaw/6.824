@@ -70,3 +70,5 @@ hint里说
 拿nReduce=10作为一个例子的话，master会给10个worker分配reduce工作。给他们发的index分别是0,1,2,...,9
 
 拿到reduce工作的worker需要去找所有为mr-x-index格式的文件，将其统计即可。其中x是变量。
+
+maybe是因为测试脚本只产生了3个worker？应该让worker干完活之后再去领点任务做做
