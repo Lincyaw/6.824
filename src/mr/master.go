@@ -3,11 +3,11 @@ package mr
 import (
 	"io/ioutil"
 	"log"
+	"net"
+	"net/http"
+	"net/rpc"
 	"os"
 )
-import "net"
-import "net/rpc"
-import "net/http"
 
 type Master struct {
 	// 要处理哪些文件
@@ -44,13 +44,14 @@ func (m *Master) ReceiveStatus(args *WorkStatus, reply *Reply) error {
 			log.Println("Reduce", m.taskMap[args.WorkerId], "failed")
 		}
 	}
+	// Send map work first
 	for i := range m.nWorker {
 		if m.nWorker[i] != Finish {
 			return nil
 		}
 	}
-	for i := range m.reduceWork{
-		if m.reduceWork[i] != Finish{
+	for i := range m.reduceWork {
+		if m.reduceWork[i] != Finish {
 			return nil
 		}
 	}
@@ -65,17 +66,19 @@ func (m *Master) ReceiveStatus(args *WorkStatus, reply *Reply) error {
 //
 // the RPC argument and reply types are defined in rpc.go.
 //
+
+// Worker request a task to master
 func (m *Master) SendTask(args *Args, reply *Reply) error {
 	log.Println("taskId: ", args.WorkerId)
 	// 每次调用这个函数，只分配一个任务
 	for i := range m.nWorker {
 		if m.nWorker[i] == NotStarted {
 			reply.Filename = m.files[i]
-
 			file, err := os.Open(reply.Filename)
 			if err != nil {
 				log.Fatalf("cannot open %v", reply.Filename)
 			}
+			defer file.Close()
 			content, err := ioutil.ReadAll(file)
 			if err != nil {
 				log.Fatalf("cannot read %v", reply.Filename)
@@ -83,14 +86,12 @@ func (m *Master) SendTask(args *Args, reply *Reply) error {
 			// 将id和对应的任务映射起来
 			m.taskMap[args.WorkerId] = i
 
-			reply.Content = string(content)
+			reply.Content = string(content) // send all the doc.
 			reply.WorkType = "map"
 			reply.Id = i
 			reply.NReduce = m.nReduce
 			reply.Valid = true
-			if err := file.Close(); err != nil {
-				log.Fatalf("close file error %v", reply.Filename)
-			}
+
 			m.nWorker[i] = InTheMid
 			log.Println("Map", i, "send out")
 

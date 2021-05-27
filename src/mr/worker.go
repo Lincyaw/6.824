@@ -4,14 +4,14 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
+	"log"
+	"net/rpc"
 	"os"
 	"sort"
 	"strconv"
 	"time"
 )
-import "log"
-import "net/rpc"
-import "hash/fnv"
 
 //
 // Map functions return a slice of KeyValue.
@@ -63,7 +63,7 @@ func Worker(mapf func(string, string) []KeyValue,
 	// send the RPC request, wait for the reply.
 	call("Master.SendTask", &args, &reply)
 	// 如果任务一直有效，则一直干活
-	for reply.Valid == true {
+	for reply.Valid {
 		workArgs := WorkStatus{
 			WorkerId: args.WorkerId,
 			WorkType: reply.WorkType,
@@ -82,7 +82,7 @@ func Worker(mapf func(string, string) []KeyValue,
 		}
 		reply = Reply{}
 		call("Master.SendTask", &args, &reply)
-		fmt.Println("Work is valid? ",reply.Valid)
+		fmt.Println("Work is valid? ", reply.Valid)
 	}
 }
 func MapWork(mapf func(string, string) []KeyValue, reply Reply) bool {
