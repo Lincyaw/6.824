@@ -4,6 +4,16 @@
 否则会因为go module的原因，无法运行
 # LAB1
 
+```sh
+# 1. Enter the 'main' folder, then excute the following command, making the wc.so freshly built
+go build -buildmode=plugin ../mrapps/wc.go
+# 2. Delete the previous output
+rm mr-out*
+# 3. Start master
+go run mrmaster.go pg-*.txt
+# 4. Open another shell in the same directory, starting the worker.
+go run mrworker.go wc.so
+```
 ## step1
 本次实验的任务是实现一个分布式的MapReduce。只需要修改`mr/master.go`,`mr/worker.go`,`mr/rpc.go`三个文件。
 
@@ -42,7 +52,7 @@ Worker这边呢，则发送了一个示例的请求给master。因此我们需�
 下一步工作具体要看hint的第6点及其之后的东西。
 
 mrsequential 中的实现方法是：map 产生的中间文件全都存在一个文件里，然后通过排序，将其变成有序。
-有序之后就开始遍历，如果key相同，则把他加到一个数组里。reduce的任务就是返回数组的长度。- -，看起来挺憨的。
+有序之后就开始遍历，如果key相同，则把他加到一个数组里。reduce的任务就是返回数组的长度。(- -，看起来挺憨的。)
 
 hint里说
 > The map part of your worker can use the ihash(key) function (in worker.go) to pick the reduce task for a given key.
