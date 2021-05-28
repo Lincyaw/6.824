@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/rpc"
 	"os"
+	"sync"
 	"time"
 )
 
@@ -24,21 +25,23 @@ type Master struct {
 
 	taskMap map[string]int
 }
-
+var mu = sync.Mutex{}
+var sendMu = sync.Mutex{}
 func (m *Master) ReceiveStatus(args *WorkStatus, reply *ReplyWorker) error {
 	if args.WorkType == "map" {
 		if args.Done {
 			m.nWorker[m.taskMap[args.WorkerId]] = Finish
-			log.Println("Map", m.taskMap[args.WorkerId], "finished")
+			//log.Println("Map", m.taskMap[args.WorkerId], "finished")
 		} else {
 			// 归零
 			m.nWorker[m.taskMap[args.WorkerId]] = NotStarted
+
 			log.Println("Map", m.taskMap[args.WorkerId], "failed")
 		}
 	} else {
 		if args.Done {
 			m.reduceWork[m.taskMap[args.WorkerId]] = Finish
-			log.Println("Reduce", m.taskMap[args.WorkerId], "finished")
+			//log.Println("Reduce", m.taskMap[args.WorkerId], "finished")
 		} else {
 			// 归零
 			m.reduceWork[m.taskMap[args.WorkerId]] = NotStarted
@@ -55,6 +58,7 @@ func (m *Master) ReceiveStatus(args *WorkStatus, reply *ReplyWorker) error {
 		if m.reduceWork[i] != Finish {
 			return nil
 		}
+
 	}
 	m.done = true
 	return nil
@@ -64,14 +68,19 @@ func waitJob(m *Master,workType , workerId string)  {
 	time.Sleep(time.Duration(10)*time.Second)
 	switch workType {
 	case "map":
+		mu.Lock()
 		if m.nWorker[m.taskMap[workerId]] == InTheMid {
 			m.nWorker[m.taskMap[workerId]] = NotStarted
 		}
+		mu.Unlock()
 	case "reduce":
+		mu.Lock()
 		if m.reduceWork[m.taskMap[workerId]] == InTheMid {
 			m.reduceWork[m.taskMap[workerId]] = NotStarted
 		}
+		mu.Unlock()
 	}
+
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -82,7 +91,7 @@ func waitJob(m *Master,workType , workerId string)  {
 //
 // Worker request a task to master
 func (m *Master) SendTask(args *Args, reply *ReplyWorker) error {
-	log.Println("taskId: ", args.WorkerId)
+	//log.Println("taskId: ", args.WorkerId)
 	// 每次调用这个函数，只分配一个任务
 	for i := range m.nWorker {
 		if m.nWorker[i] == NotStarted {
@@ -104,9 +113,10 @@ func (m *Master) SendTask(args *Args, reply *ReplyWorker) error {
 			reply.Id = i
 			reply.NReduce = m.nReduce
 			reply.Valid = true
-
+			sendMu.Lock()
 			m.nWorker[i] = InTheMid
-			log.Println("Map", i, "send out")
+			sendMu.Unlock()
+			//log.Println("Map", i, "send out")
 
 			// todo：发射一个定时器，来检查 10 秒后任务是否完成，否则就任务这个 worker 挂掉了
 			go waitJob(m,"map",args.WorkerId)
@@ -122,13 +132,15 @@ func (m *Master) SendTask(args *Args, reply *ReplyWorker) error {
 			reply.Id = k
 			reply.NMap = len(m.files)
 			reply.NReduce = m.nReduce
+			sendMu.Lock()
 			m.reduceWork[k] = InTheMid
-			log.Println("Reduce", k, "send out")
+			sendMu.Unlock()
+			//log.Println("Reduce", k, "send out")
 			go waitJob(m,"reduce",args.WorkerId)
 			return nil
 		}
 	}
-	log.Println("All Done!!!!!!!!")
+	//log.Println("All Done!!!!!!!!")
 	reply.Valid = false
 	return nil
 }
@@ -168,7 +180,7 @@ func (m *Master) Done() bool {
 //
 func MakeMaster(files []string, nReduce int) *Master {
 	m := Master{}
-	log.Println("file number: ", len(files), "reduce job number:", nReduce)
+	//log.Println("file number: ", len(files), "reduce job number:", nReduce)
 	// Your code here.
 	m.files = files
 	m.nReduce = nReduce

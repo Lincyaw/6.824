@@ -61,7 +61,10 @@ func Worker(mapf func(string, string) []KeyValue,
 	args := Args{WorkerId: genWorkerID()}
 	reply := ReplyWorker{}
 	// send the RPC request, wait for the reply.
-	call("Master.SendTask", &args, &reply)
+	ret := call("Master.SendTask", &args, &reply)
+	if ret == false {
+		return
+	}
 	// 如果任务一直有效，则一直干活
 	for reply.Valid {
 		workArgs := WorkStatus{
@@ -78,12 +81,18 @@ func Worker(mapf func(string, string) []KeyValue,
 				workArgs.Done = true
 			}
 		}
-		call("Master.ReceiveStatus", &workArgs, &reply)
-
+		ret = call("Master.ReceiveStatus", &workArgs, &reply)
+		if ret == false {
+			return
+		}
+		time.Sleep(time.Duration(1)*time.Second)
 		// Current work finished, request a new work.
 		reply = ReplyWorker{}
-		call("Master.SendTask", &args, &reply)
-		fmt.Println("Work is valid? ", reply.Valid)
+		ret = call("Master.SendTask", &args, &reply)
+		if ret == false {
+			return
+		}
+		//fmt.Println("Work is valid? ", reply.Valid)
 	}
 }
 func MapWork(mapf func(string, string) []KeyValue, reply ReplyWorker) bool {
@@ -118,7 +127,7 @@ func MapWork(mapf func(string, string) []KeyValue, reply ReplyWorker) bool {
 			}
 		}
 	}
-	log.Println("Map execute succeed")
+	//log.Println("Map execute succeed")
 	return true
 }
 func ReduceWork(reducef func(string, []string) string, reply ReplyWorker) bool {
@@ -135,6 +144,7 @@ func ReduceWork(reducef func(string, []string) string, reply ReplyWorker) bool {
 		var kv KeyValue
 		for decoder.More() {
 			if err := decoder.Decode(&kv); err != nil {
+				// todo: here always have problems
 				log.Println("Json decode failed, ", err)
 			}
 			intermediate = append(intermediate, kv)
@@ -164,7 +174,7 @@ func ReduceWork(reducef func(string, []string) string, reply ReplyWorker) bool {
 	}
 	defer ofile.Close()
 
-	log.Println("Reduce execute succeed")
+	//log.Println("Reduce execute succeed")
 	return true
 }
 
@@ -202,6 +212,7 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	c, err := rpc.DialHTTP("unix", sockname)
 	if err != nil {
 		log.Fatal("dialing:", err)
+		return false
 	}
 	defer c.Close()
 
