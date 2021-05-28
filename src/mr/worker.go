@@ -59,7 +59,7 @@ func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
 	args := Args{WorkerId: genWorkerID()}
-	reply := Reply{}
+	reply := ReplyWorker{}
 	// send the RPC request, wait for the reply.
 	call("Master.SendTask", &args, &reply)
 	// 如果任务一直有效，则一直干活
@@ -73,20 +73,20 @@ func Worker(mapf func(string, string) []KeyValue,
 			if MapWork(mapf, reply) {
 				workArgs.Done = true
 			}
-			call("Master.ReceiveStatus", &workArgs, &reply)
 		} else {
 			if ReduceWork(reducef, reply) {
 				workArgs.Done = true
 			}
-			call("Master.ReceiveStatus", &workArgs, &reply)
 		}
-		reply = Reply{}
+		call("Master.ReceiveStatus", &workArgs, &reply)
+
+		// Current work finished, request a new work.
+		reply = ReplyWorker{}
 		call("Master.SendTask", &args, &reply)
 		fmt.Println("Work is valid? ", reply.Valid)
 	}
 }
-func MapWork(mapf func(string, string) []KeyValue, reply Reply) bool {
-	mapf(reply.Filename, reply.Content)
+func MapWork(mapf func(string, string) []KeyValue, reply ReplyWorker) bool {
 	kvs := mapf(reply.Filename, reply.Content)
 	// 二维的kv, 即 nReduce 个桶
 	reduces := make([][]KeyValue, reply.NReduce)
@@ -95,6 +95,7 @@ func MapWork(mapf func(string, string) []KeyValue, reply Reply) bool {
 		idx := ihash(kv.Key) % reply.NReduce
 		reduces[idx] = append(reduces[idx], kv)
 	}
+	// Intermediate format: mr-sourceFileId-targetFileId
 	for idx, reduce := range reduces {
 		file := fmt.Sprintf("mr-%v-%v", reply.Id, idx)
 		_, err := os.Stat(file)
@@ -120,8 +121,9 @@ func MapWork(mapf func(string, string) []KeyValue, reply Reply) bool {
 	log.Println("Map execute succeed")
 	return true
 }
-func ReduceWork(reducef func(string, []string) string, reply Reply) bool {
+func ReduceWork(reducef func(string, []string) string, reply ReplyWorker) bool {
 	var intermediate []KeyValue
+	// this worker need to deal with the "reply.Id" reduce work.
 	for n := 0; n < reply.NMap; n++ {
 		fileName := "mr-" + strconv.Itoa(n) + "-" + strconv.Itoa(reply.Id)
 		f, err := os.Open(fileName)
@@ -137,7 +139,6 @@ func ReduceWork(reducef func(string, []string) string, reply Reply) bool {
 			}
 			intermediate = append(intermediate, kv)
 		}
-
 	}
 	sort.Sort(ByKey(intermediate))
 	i := 0
@@ -146,6 +147,7 @@ func ReduceWork(reducef func(string, []string) string, reply Reply) bool {
 		log.Println("Unable to create file, ", err)
 		return false
 	}
+	// fast and slow pointers to calculate the numbers of the same key
 	for i < len(intermediate) {
 		j := i + 1
 		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {

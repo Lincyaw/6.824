@@ -34,7 +34,7 @@ type Args struct {
 	WorkerId string
 }
 
-type Reply struct {
+type ReplyWorker struct {
 	// 是否有任务
 	Valid bool
 	// 文件名（实际上并没有用到这个参数

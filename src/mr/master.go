@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/rpc"
 	"os"
+	"time"
 )
 
 type Master struct {
@@ -24,7 +25,7 @@ type Master struct {
 	taskMap map[string]int
 }
 
-func (m *Master) ReceiveStatus(args *WorkStatus, reply *Reply) error {
+func (m *Master) ReceiveStatus(args *WorkStatus, reply *ReplyWorker) error {
 	if args.WorkType == "map" {
 		if args.Done {
 			m.nWorker[m.taskMap[args.WorkerId]] = Finish
@@ -59,16 +60,28 @@ func (m *Master) ReceiveStatus(args *WorkStatus, reply *Reply) error {
 	return nil
 }
 
-// Your code here -- RPC handlers for the worker to call.
+func waitJob(m *Master,workType , workerId string)  {
+	time.Sleep(time.Duration(10)*time.Second)
+	switch workType {
+	case "map":
+		if m.nWorker[m.taskMap[workerId]] == InTheMid {
+			m.nWorker[m.taskMap[workerId]] = NotStarted
+		}
+	case "reduce":
+		if m.reduceWork[m.taskMap[workerId]] == InTheMid {
+			m.reduceWork[m.taskMap[workerId]] = NotStarted
+		}
+	}
+}
 
+// Your code here -- RPC handlers for the worker to call.
 //
 // an example RPC handler.
 //
 // the RPC argument and reply types are defined in rpc.go.
 //
-
 // Worker request a task to master
-func (m *Master) SendTask(args *Args, reply *Reply) error {
+func (m *Master) SendTask(args *Args, reply *ReplyWorker) error {
 	log.Println("taskId: ", args.WorkerId)
 	// 每次调用这个函数，只分配一个任务
 	for i := range m.nWorker {
@@ -96,6 +109,7 @@ func (m *Master) SendTask(args *Args, reply *Reply) error {
 			log.Println("Map", i, "send out")
 
 			// todo：发射一个定时器，来检查 10 秒后任务是否完成，否则就任务这个 worker 挂掉了
+			go waitJob(m,"map",args.WorkerId)
 			return nil
 		}
 	}
@@ -110,6 +124,7 @@ func (m *Master) SendTask(args *Args, reply *Reply) error {
 			reply.NReduce = m.nReduce
 			m.reduceWork[k] = InTheMid
 			log.Println("Reduce", k, "send out")
+			go waitJob(m,"reduce",args.WorkerId)
 			return nil
 		}
 	}
@@ -146,14 +161,14 @@ func (m *Master) Done() bool {
 	return m.done
 }
 
-//
+// MakeMaster
 // create a Master.
 // main/mrmaster.go calls this function.
 // nReduce is the number of reduce tasks to use.
 //
 func MakeMaster(files []string, nReduce int) *Master {
 	m := Master{}
-	log.Println(files)
+	log.Println("file number: ", len(files), "reduce job number:", nReduce)
 	// Your code here.
 	m.files = files
 	m.nReduce = nReduce
