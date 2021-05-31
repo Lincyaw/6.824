@@ -18,12 +18,17 @@ package raft
 //
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
+	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"../labrpc"
+	log "github.com/sirupsen/logrus"
 )
 
 // import "bytes"
@@ -65,14 +70,38 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	CurrentState int // 当前的状态
-	Term         int // 当前的任期
-	LogIndex     int // log 中最后一条
+	Term    int32 // 当前的任期
+	VoteFor int   //candidateId that received vote in current term (or null if none)
+	Logs    []Log
 
-	// 在定时器超时之前是否收到了心跳
-	receiveHeartBeat bool
-	// 在选举定时器超时之前是否产生了 leader
-	leaderBeforeTimeOut bool
+	CommitIndex int
+	LastApplied int
+
+	NextIndex  []int
+	MatchIndex []int
+
+	// 我自己添加的状态
+	CurrentState        int32 // 当前的状态
+	receiveHeartBeat    bool  // 在定时器超时之前是否收到了心跳
+	leaderBeforeTimeOut bool  // 在选举定时器超时之前是否产生了 leader
+}
+
+func (rf *Raft) String() string {
+	b, err := json.Marshal(*rf)
+	if err != nil {
+		return fmt.Sprintf("%+v", *rf)
+	}
+	var out bytes.Buffer
+	err = json.Indent(&out, b, "", "    ")
+	if err != nil {
+		return fmt.Sprintf("%+v", *rf)
+	}
+	return out.String()
+}
+
+type Log struct {
+	Term    int
+	Command string
 }
 
 // return currentTerm and whether this server
@@ -85,7 +114,7 @@ func (rf *Raft) GetState() (int, bool) {
 	if rf.CurrentState == LEADER {
 		isleader = true
 	}
-	return rf.Term, isleader
+	return int(rf.Term), isleader
 }
 
 //
@@ -152,7 +181,7 @@ type RequestVoteReply struct {
 	// 当前任期号，以便候选人更新自己的任期号
 	Term int
 	// 是否同意这次选票
-	voteGranted bool
+	VoteGranted bool
 }
 
 //
@@ -160,12 +189,12 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	if args.Term >= rf.Term && args.LastLogIndex >= rf.LogIndex {
-		reply.voteGranted = true
+	if args.Term >= int(rf.Term) && args.LastLogIndex >= len(rf.Logs) {
+		reply.VoteGranted = true
 		reply.Term = args.Term
 	} else {
-		reply.voteGranted = false
-		reply.Term = rf.Term
+		reply.VoteGranted = false
+		reply.Term = int(rf.Term)
 	}
 }
 
@@ -218,12 +247,11 @@ type AppendEntriesReply struct {
 
 // 心跳通知、日志追加 RPC
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	if args.Term < rf.Term {
+	if args.Term < int(rf.Term) {
 		reply.Success = false
-		reply.Term = rf.Term
+		reply.Term = int(rf.Term)
 		return
 	}
-
 }
 
 //
@@ -285,8 +313,7 @@ func (rf *Raft) killed() bool {
 //
 // peers: 一组网络标识符
 // me: 本端在 peers 中的下标
-func Make(peers []*labrpc.ClientEnd, me int,
-	persister *Persister, applyCh chan ApplyMsg) *Raft {
+func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
@@ -294,52 +321,135 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.Term = 0
+	rf.CurrentState = FOLLOWER
+	rf.leaderBeforeTimeOut = false
+	rf.receiveHeartBeat = false
+	rf.Logs = append(rf.Logs, Log{
+		Term:    0,
+		Command: "Init",
+	})
+
 	// 启动心跳计时器，超时则发起选举，自己变成候选人状态
-	go rf.CheckHeartBeatsClock()
+	ctx := context.Background()
+	go rf.CheckHeartBeatsClock(ctx, rand.Int())
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	return rf
 }
 
+func (rf *Raft) startVote() {
+	// 自增任期号
+	atomic.AddInt32(&rf.Term, 1)
+	// 自己给自己投票
+	cnt := 1
+	// 转换自己的状态为 Candicater
+	atomic.StoreInt32(&rf.CurrentState, CANDICATER)
+	args := &RequestVoteArgs{}
+	args.CandidateId = rf.me
+	args.Term = int(rf.Term)
+	args.LastLogIndex = len(rf.Logs)
+	args.LastLogTerm = rf.Logs[len(rf.Logs)-1].Term
+	// todo: 添加剩余的参数
+	replies := make([]*RequestVoteReply, len(rf.peers))
+	log.Println(rf.String())
+	log.Println(args)
+
+	// 在这里发起一次选举，向所有的 server 发送选举请求
+	for idx, server := range rf.peers {
+		if idx != rf.me {
+			replies[idx] = new(RequestVoteReply)
+			server.Call("Raft.RequestVote", args, replies[idx])
+			log.Println("reply is: ", replies[idx])
+
+		}
+	}
+
+	for idx, v := range replies {
+		if idx != rf.me {
+			log.Println("into function")
+			if v.VoteGranted {
+				cnt++
+			}
+
+			if v.Term > int(rf.Term) {
+				atomic.StoreInt32(&rf.Term, int32(v.Term))
+			}
+		}
+	}
+
+	if cnt > len(rf.peers)/2 {
+		rf.CurrentState = LEADER
+	} else {
+		rf.CurrentState = CANDICATER
+	}
+}
+
 // 因为不允许使用 time.ticker，指导书建议用一个 for 循环 + sleep 来实现计时器
 // 检查心跳计时器
-func (rf *Raft) CheckHeartBeatsClock() {
-	for{
-		rf.mu.Lock()
-		rf.receiveHeartBeat = false
-		rf.mu.Unlock()
-
-		time.Sleep(1 * time.Second)
-		// 没收到心跳
-		if rf.receiveHeartBeat == false {
-			// todo：在这里发起一次选举
-
-		}
-	}
-}
-// 选举超时计时器
-func (rf *Raft) ElectionClock() {
-	for{
-		rf.mu.Lock()
-		rf.leaderBeforeTimeOut = false
-		rf.mu.Unlock()
-
-		time.Sleep(1 * time.Second)
-		// 没产生 leader
-		if rf.leaderBeforeTimeOut == false {
-			// todo：在这里发起一次选举
-		}
-	}
-}
-// 发送心跳计时器
-func (rf *Raft) SendHearBeatsClock(ctx *context.Context) {
+// 超时 timeout ms
+func (rf *Raft) CheckHeartBeatsClock(ctx context.Context, timeout int) {
 	for {
 		select {
 		default:
+			// 初始化标志位
+			rf.mu.Lock()
+			rf.receiveHeartBeat = false
+			rf.mu.Unlock()
 
+			time.Sleep(time.Duration(timeout) * time.Millisecond)
+			// 自己不是 leader && 没收到心跳
+			if rf.CurrentState != LEADER && !rf.receiveHeartBeat {
+				rf.startVote()
+			}
+		case <-ctx.Done():
+			return
 		}
-		time.Sleep(1 * time.Second)
-		// todo: 对所有的服务器发送心跳
+	}
+}
+
+// 选举超时计时器
+func (rf *Raft) ElectionClock(ctx context.Context, timeout int) {
+	for {
+		select {
+		default:
+			// 初始化标志位
+			rf.mu.Lock()
+			rf.leaderBeforeTimeOut = false
+			rf.mu.Unlock()
+
+			time.Sleep(time.Duration(timeout) * time.Second)
+			// 没产生 leader
+			if !rf.leaderBeforeTimeOut {
+				rf.startVote()
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// 发送心跳计时器
+func (rf *Raft) SendHearBeatsClock(ctx context.Context) {
+
+	for {
+		select {
+		default:
+			args := &AppendEntriesArgs{}
+			replies := make([]*AppendEntriesReply, len(rf.peers))
+			for idx, server := range rf.peers {
+				if idx != rf.me {
+					replies[idx] = new(AppendEntriesReply)
+					server.Call("Raft.AppendEntries", args, replies[idx])
+					if replies[idx].Term > int(rf.Term) {
+						atomic.StoreInt32(&rf.Term, int32(replies[idx].Term))
+						atomic.StoreInt32(&rf.CurrentState, FOLLOWER)
+					}
+				}
+			}
+		case <-ctx.Done():
+			return
+		}
+
 	}
 }
