@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -67,6 +68,11 @@ type Raft struct {
 	CurrentState int // 当前的状态
 	Term         int // 当前的任期
 	LogIndex     int // log 中最后一条
+
+	// 在定时器超时之前是否收到了心跳
+	receiveHeartBeat bool
+	// 在选举定时器超时之前是否产生了 leader
+	leaderBeforeTimeOut bool
 }
 
 // return currentTerm and whether this server
@@ -126,10 +132,15 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	Term         int
-	CandicateId  int
+
+	// 候选人的任期号
+	Term int
+	// 请求选票的候选人 id
+	CandidateId int
+	// 候选人最后日志条目的索引值
 	LastLogIndex int
-	LastLogTerm  int
+	// 候选人最后日志条目的任期号
+	LastLogTerm int
 }
 
 //
@@ -138,7 +149,9 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
-	Term        int
+	// 当前任期号，以便候选人更新自己的任期号
+	Term int
+	// 是否同意这次选票
 	voteGranted bool
 }
 
@@ -192,18 +205,19 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 type AppendEntriesArgs struct {
 	// leader's term
-	Term int
-	LeaderId int
+	Term         int
+	LeaderId     int
 	PrevLogIndex int
-	Entries []int
+	Entries      []int
 	LeaderCommit int
 }
 type AppendEntriesReply struct {
-	Term int
+	Term    int
 	Success bool
 }
 
-func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply){
+// 心跳通知、日志追加 RPC
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	if args.Term < rf.Term {
 		reply.Success = false
 		reply.Term = rf.Term
@@ -211,10 +225,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 }
-
-
-
-
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -284,15 +294,52 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.Term = 0
+	// 启动心跳计时器，超时则发起选举，自己变成候选人状态
+	go rf.CheckHeartBeatsClock()
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	return rf
 }
 
-func (rf *Raft) CheckHeartBeats() {
-	for {
-		time.Sleep(5 * time.Second)
+// 因为不允许使用 time.ticker，指导书建议用一个 for 循环 + sleep 来实现计时器
+// 检查心跳计时器
+func (rf *Raft) CheckHeartBeatsClock() {
+	for{
+		rf.mu.Lock()
+		rf.receiveHeartBeat = false
+		rf.mu.Unlock()
 
+		time.Sleep(1 * time.Second)
+		// 没收到心跳
+		if rf.receiveHeartBeat == false {
+			// todo：在这里发起一次选举
+
+		}
+	}
+}
+// 选举超时计时器
+func (rf *Raft) ElectionClock() {
+	for{
+		rf.mu.Lock()
+		rf.leaderBeforeTimeOut = false
+		rf.mu.Unlock()
+
+		time.Sleep(1 * time.Second)
+		// 没产生 leader
+		if rf.leaderBeforeTimeOut == false {
+			// todo：在这里发起一次选举
+		}
+	}
+}
+// 发送心跳计时器
+func (rf *Raft) SendHearBeatsClock(ctx *context.Context) {
+	for {
+		select {
+		default:
+
+		}
+		time.Sleep(1 * time.Second)
+		// todo: 对所有的服务器发送心跳
 	}
 }
