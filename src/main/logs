@@ -1,0 +1,5 @@
+*** Starting wc test.
+mr-wc-all mr-correct-wc.txt differ: byte 132, line 15
+--- wc output is not the same as mr-correct-wc.txt
+--- wc test: FAIL
+*** Starting indexer test.

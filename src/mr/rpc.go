@@ -6,20 +6,15 @@ package mr
 // remember to capitalize all names.
 //
 
-import "os"
-import "strconv"
+import (
+	"os"
+	"strconv"
+)
 
 //
 // example to show how to declare the arguments
 // and reply for an RPC.
 //
-type TaskStatus int
-
-const (
-	NotStarted TaskStatus = 0
-	InTheMid   TaskStatus = 1
-	Finish     TaskStatus = 2
-)
 
 type ExampleArgs struct {
 	X int

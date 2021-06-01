@@ -2,83 +2,101 @@ package mr
 
 import (
 	"io/ioutil"
-	"log"
 	"net"
 	"net/http"
 	"net/rpc"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 )
 
 type Master struct {
-	// 要处理哪些文件
-	files []string
-	// 对应的这些文件工作的状态
-	nWorker []TaskStatus
-	// 要有几个reduce工作
-	nReduce int
-	// 对应的这几个reduce工作是否完成
-	reduceWork []TaskStatus
+	// 锁
+	mu sync.Mutex
+	// 未做的任务列表
+	Works chan Work
+	// 已经发送的任务列表，不确定是否能够做完
+	UnDoneWorks chan Work
+	// the number of reduce tasks to use.
+	NReduce int
 	// 所有工作都完成了吗
 	done bool
-
-	taskMap map[string]int
 }
-var mu = sync.Mutex{}
-var sendMu = sync.Mutex{}
+
+type Work struct {
+	WorkId   int
+	WorkType string
+	FileName string
+}
+
+const (
+	NotStarted = 0
+	InTheMid   = 1
+	Finish     = 2
+)
+
 func (m *Master) ReceiveStatus(args *WorkStatus, reply *ReplyWorker) error {
 	if args.WorkType == "map" {
 		if args.Done {
-			m.nWorker[m.taskMap[args.WorkerId]] = Finish
-			//log.Println("Map", m.taskMap[args.WorkerId], "finished")
+			atomic.StoreInt32(&m.nWorker[m.taskMap[args.WorkerId]], Finish)
+			log.Info("Map", m.taskMap[args.WorkerId], " finished")
 		} else {
 			// 归零
-			m.nWorker[m.taskMap[args.WorkerId]] = NotStarted
-
-			log.Println("Map", m.taskMap[args.WorkerId], "failed")
+			atomic.StoreInt32(&m.nWorker[m.taskMap[args.WorkerId]], NotStarted)
+			log.Fatal("Map", m.taskMap[args.WorkerId], " failed")
 		}
 	} else {
 		if args.Done {
-			m.reduceWork[m.taskMap[args.WorkerId]] = Finish
-			//log.Println("Reduce", m.taskMap[args.WorkerId], "finished")
+			atomic.StoreInt32(&m.reduceWork[m.taskMap[args.WorkerId]], Finish)
+			log.Info("Reduce", m.taskMap[args.WorkerId], " finished")
 		} else {
 			// 归零
-			m.reduceWork[m.taskMap[args.WorkerId]] = NotStarted
-			log.Println("Reduce", m.taskMap[args.WorkerId], "failed")
+			atomic.StoreInt32(&m.reduceWork[m.taskMap[args.WorkerId]], NotStarted)
+			log.Fatal("Reduce", m.taskMap[args.WorkerId], " failed")
 		}
 	}
+	m.mu.Lock()
 	// Send map work first
 	for i := range m.nWorker {
 		if m.nWorker[i] != Finish {
+			m.mu.Unlock()
 			return nil
 		}
 	}
 	for i := range m.reduceWork {
 		if m.reduceWork[i] != Finish {
+			m.mu.Unlock()
 			return nil
 		}
 
 	}
 	m.done = true
+	m.mu.Unlock()
 	return nil
 }
 
-func waitJob(m *Master,workType , workerId string)  {
-	time.Sleep(time.Duration(10)*time.Second)
+func waitJob(m *Master, workType, workerId string) {
+	// 睡 10 s
+	mu := sync.Mutex{}
+	mu.Lock()
+	defer mu.Unlock()
+	time.Sleep(time.Duration(10) * time.Second)
 	switch workType {
 	case "map":
-		mu.Lock()
+		m.mu.Lock()
 		if m.nWorker[m.taskMap[workerId]] == InTheMid {
 			m.nWorker[m.taskMap[workerId]] = NotStarted
 		}
-		mu.Unlock()
+		m.mu.Unlock()
 	case "reduce":
-		mu.Lock()
+		m.mu.Lock()
 		if m.reduceWork[m.taskMap[workerId]] == InTheMid {
 			m.reduceWork[m.taskMap[workerId]] = NotStarted
 		}
-		mu.Unlock()
+		m.mu.Unlock()
 	}
 
 }
@@ -91,10 +109,15 @@ func waitJob(m *Master,workType , workerId string)  {
 //
 // Worker request a task to master
 func (m *Master) SendTask(args *Args, reply *ReplyWorker) error {
-	//log.Println("taskId: ", args.WorkerId)
 	// 每次调用这个函数，只分配一个任务
+	// work := <-m.Works
+
 	for i := range m.nWorker {
 		if m.nWorker[i] == NotStarted {
+			// 发送任务时需要考虑并发，保证每个任务在同一时刻只能有一个 worker 在访问
+			m.mu.Lock()
+			m.nWorker[i] = InTheMid
+			m.mu.Unlock()
 			reply.Filename = m.files[i]
 			file, err := os.Open(reply.Filename)
 			if err != nil {
@@ -113,16 +136,13 @@ func (m *Master) SendTask(args *Args, reply *ReplyWorker) error {
 			reply.Id = i
 			reply.NReduce = m.nReduce
 			reply.Valid = true
-			sendMu.Lock()
-			m.nWorker[i] = InTheMid
-			sendMu.Unlock()
-			//log.Println("Map", i, "send out")
 
-			// todo：发射一个定时器，来检查 10 秒后任务是否完成，否则就任务这个 worker 挂掉了
-			go waitJob(m,"map",args.WorkerId)
+			// 发射一个定时器，来检查 10 秒后任务是否完成，否则就任务这个 worker 挂掉了
+			go waitJob(m, "map", args.WorkerId)
 			return nil
 		}
 	}
+
 	// 如果到这一步，说明map任务都发送出去了
 	for k := 0; k < m.nReduce; k++ {
 		if m.reduceWork[k] == NotStarted {
@@ -132,15 +152,11 @@ func (m *Master) SendTask(args *Args, reply *ReplyWorker) error {
 			reply.Id = k
 			reply.NMap = len(m.files)
 			reply.NReduce = m.nReduce
-			sendMu.Lock()
 			m.reduceWork[k] = InTheMid
-			sendMu.Unlock()
-			//log.Println("Reduce", k, "send out")
-			go waitJob(m,"reduce",args.WorkerId)
+			go waitJob(m, "reduce", args.WorkerId)
 			return nil
 		}
 	}
-	//log.Println("All Done!!!!!!!!")
 	reply.Valid = false
 	return nil
 }
@@ -180,19 +196,14 @@ func (m *Master) Done() bool {
 //
 func MakeMaster(files []string, nReduce int) *Master {
 	m := Master{}
-	//log.Println("file number: ", len(files), "reduce job number:", nReduce)
-	// Your code here.
-	m.files = files
-	m.nReduce = nReduce
-	m.nWorker = make([]TaskStatus, len(files))
-	m.reduceWork = make([]TaskStatus, nReduce)
-	m.taskMap = make(map[string]int)
-	for i := range m.nWorker {
-		m.nWorker[i] = NotStarted
+	for idx, file := range files {
+		work := Work{}
+		work.FileName = file
+		work.WorkId = idx
+		work.WorkType = "map"
+		m.Works <- work
 	}
-	for i := range m.reduceWork {
-		m.reduceWork[i] = NotStarted
-	}
+	m.NReduce = nReduce
 	m.server()
 	return &m
 }

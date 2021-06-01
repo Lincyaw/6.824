@@ -85,7 +85,7 @@ func Worker(mapf func(string, string) []KeyValue,
 		if ret == false {
 			return
 		}
-		time.Sleep(time.Duration(1)*time.Second)
+		time.Sleep(time.Duration(1) * time.Second)
 		// Current work finished, request a new work.
 		reply = ReplyWorker{}
 		ret = call("Master.SendTask", &args, &reply)
@@ -138,14 +138,14 @@ func ReduceWork(reducef func(string, []string) string, reply ReplyWorker) bool {
 		f, err := os.Open(fileName)
 		defer f.Close()
 		if err != nil {
-			fmt.Println("unable to read ", fileName)
+			log.Fatal("unable to read ", fileName)
 		}
 		decoder := json.NewDecoder(f)
 		var kv KeyValue
 		for decoder.More() {
 			if err := decoder.Decode(&kv); err != nil {
 				// todo: here always have problems
-				log.Println("Json decode failed, ", err)
+				log.Fatal("Json decode failed, ", err)
 			}
 			intermediate = append(intermediate, kv)
 		}
