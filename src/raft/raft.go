@@ -17,14 +17,22 @@ package raft
 //   in the same server.
 //
 
-import "sync"
-import "sync/atomic"
-import "../labrpc"
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"math/rand"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"../labrpc"
+	log "github.com/sirupsen/logrus"
+)
 
 // import "bytes"
 // import "../labgob"
-
-
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -43,6 +51,12 @@ type ApplyMsg struct {
 	CommandIndex int
 }
 
+const (
+	FOLLOWER   = 1
+	CANDICATER = 2
+	LEADER     = 3
+)
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -56,17 +70,51 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	Term    int32 // 当前的任期
+	VoteFor int   //candidateId that received vote in current term (or null if none)
+	Logs    []Log
 
+	CommitIndex int
+	LastApplied int
+
+	NextIndex  []int
+	MatchIndex []int
+
+	// 我自己添加的状态
+	CurrentState        int32 // 当前的状态
+	receiveHeartBeat    bool  // 在定时器超时之前是否收到了心跳
+	leaderBeforeTimeOut bool  // 在选举定时器超时之前是否产生了 leader
+}
+
+func (rf *Raft) String() string {
+	b, err := json.Marshal(*rf)
+	if err != nil {
+		return fmt.Sprintf("%+v", *rf)
+	}
+	var out bytes.Buffer
+	err = json.Indent(&out, b, "", "    ")
+	if err != nil {
+		return fmt.Sprintf("%+v", *rf)
+	}
+	return out.String()
+}
+
+type Log struct {
+	Term    int
+	Command string
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 
-	var term int
+	// var term int
 	var isleader bool
 	// Your code here (2A).
-	return term, isleader
+	if rf.CurrentState == LEADER {
+		isleader = true
+	}
+	return int(rf.Term), isleader
 }
 
 //
@@ -84,7 +132,6 @@ func (rf *Raft) persist() {
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
 }
-
 
 //
 // restore previously persisted state.
@@ -108,15 +155,21 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-
-
-
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+
+	// 候选人的任期号
+	Term int
+	// 请求选票的候选人 id
+	CandidateId int
+	// 候选人最后日志条目的索引值
+	LastLogIndex int
+	// 候选人最后日志条目的任期号
+	LastLogTerm int
 }
 
 //
@@ -125,6 +178,10 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	// 当前任期号，以便候选人更新自己的任期号
+	Term int
+	// 是否同意这次选票
+	VoteGranted bool
 }
 
 //
@@ -132,6 +189,13 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	if args.Term >= int(rf.Term) && args.LastLogIndex >= len(rf.Logs) {
+		reply.VoteGranted = true
+		reply.Term = args.Term
+	} else {
+		reply.VoteGranted = false
+		reply.Term = int(rf.Term)
+	}
 }
 
 //
@@ -158,7 +222,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 //
 // look at the comments in ../labrpc/labrpc.go for more details.
 //
-// if you're having trouble getting RPC to work, check that you've
+// if you're having trouble gecztting RPC to work, check that you've
 // capitalized all field names in structs passed over RPC, and
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
@@ -168,6 +232,27 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+type AppendEntriesArgs struct {
+	// leader's term
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	Entries      []int
+	LeaderCommit int
+}
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
+
+// 心跳通知、日志追加 RPC
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	if args.Term < int(rf.Term) {
+		reply.Success = false
+		reply.Term = int(rf.Term)
+		return
+	}
+}
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -183,13 +268,13 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // term. the third return value is true if this server believes it is
 // the leader.
 //
+// 让 raft 把 command 添加到 log 中
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
 	isLeader := true
 
 	// Your code here (2B).
-
 
 	return index, term, isLeader
 }
@@ -226,18 +311,145 @@ func (rf *Raft) killed() bool {
 // Make() must return quickly, so it should start goroutines
 // for any long-running work.
 //
-func Make(peers []*labrpc.ClientEnd, me int,
-	persister *Persister, applyCh chan ApplyMsg) *Raft {
+// peers: 一组网络标识符
+// me: 本端在 peers 中的下标
+func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.Term = 0
+	rf.CurrentState = FOLLOWER
+	rf.leaderBeforeTimeOut = false
+	rf.receiveHeartBeat = false
+	rf.Logs = append(rf.Logs, Log{
+		Term:    0,
+		Command: "Init",
+	})
 
+	// 启动心跳计时器，超时则发起选举，自己变成候选人状态
+	ctx := context.Background()
+	go rf.CheckHeartBeatsClock(ctx, rand.Int())
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-
 	return rf
+}
+
+func (rf *Raft) startVote() {
+	// 自增任期号
+	atomic.AddInt32(&rf.Term, 1)
+	// 自己给自己投票
+	cnt := 1
+	// 转换自己的状态为 Candicater
+	atomic.StoreInt32(&rf.CurrentState, CANDICATER)
+	args := &RequestVoteArgs{}
+	args.CandidateId = rf.me
+	args.Term = int(rf.Term)
+	args.LastLogIndex = len(rf.Logs)
+	args.LastLogTerm = rf.Logs[len(rf.Logs)-1].Term
+	// todo: 添加剩余的参数
+	replies := make([]*RequestVoteReply, len(rf.peers))
+	log.Println(rf.String())
+	log.Println(args)
+
+	// 在这里发起一次选举，向所有的 server 发送选举请求
+	for idx, server := range rf.peers {
+		if idx != rf.me {
+			replies[idx] = new(RequestVoteReply)
+			server.Call("Raft.RequestVote", args, replies[idx])
+			log.Println("reply is: ", replies[idx])
+
+		}
+	}
+
+	for idx, v := range replies {
+		if idx != rf.me {
+			log.Println("into function")
+			if v.VoteGranted {
+				cnt++
+			}
+
+			if v.Term > int(rf.Term) {
+				atomic.StoreInt32(&rf.Term, int32(v.Term))
+			}
+		}
+	}
+
+	if cnt > len(rf.peers)/2 {
+		rf.CurrentState = LEADER
+	} else {
+		rf.CurrentState = CANDICATER
+	}
+}
+
+// 因为不允许使用 time.ticker，指导书建议用一个 for 循环 + sleep 来实现计时器
+// 检查心跳计时器
+// 超时 timeout ms
+func (rf *Raft) CheckHeartBeatsClock(ctx context.Context, timeout int) {
+	for {
+		select {
+		default:
+			// 初始化标志位
+			rf.mu.Lock()
+			rf.receiveHeartBeat = false
+			rf.mu.Unlock()
+
+			time.Sleep(time.Duration(timeout) * time.Millisecond)
+			// 自己不是 leader && 没收到心跳
+			if rf.CurrentState != LEADER && !rf.receiveHeartBeat {
+				rf.startVote()
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// 选举超时计时器
+func (rf *Raft) ElectionClock(ctx context.Context, timeout int) {
+	for {
+		select {
+		default:
+			// 初始化标志位
+			rf.mu.Lock()
+			rf.leaderBeforeTimeOut = false
+			rf.mu.Unlock()
+
+			time.Sleep(time.Duration(timeout) * time.Second)
+			// 没产生 leader
+			if !rf.leaderBeforeTimeOut {
+				rf.startVote()
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// 发送心跳计时器
+func (rf *Raft) SendHearBeatsClock(ctx context.Context) {
+
+	for {
+		select {
+		default:
+			args := &AppendEntriesArgs{}
+			replies := make([]*AppendEntriesReply, len(rf.peers))
+			for idx, server := range rf.peers {
+				if idx != rf.me {
+					replies[idx] = new(AppendEntriesReply)
+					server.Call("Raft.AppendEntries", args, replies[idx])
+					if replies[idx].Term > int(rf.Term) {
+						atomic.StoreInt32(&rf.Term, int32(replies[idx].Term))
+						atomic.StoreInt32(&rf.CurrentState, FOLLOWER)
+					}
+				}
+			}
+		case <-ctx.Done():
+			return
+		}
+
+	}
 }
