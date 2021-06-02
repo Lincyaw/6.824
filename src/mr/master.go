@@ -16,12 +16,16 @@ import (
 type Master struct {
 	// 锁
 	mu sync.Mutex
-	// 未做的任务列表
-	Works chan Work
+
+	mapWork    int
+	reduceWork int
+
+	// 未做的 map 任务列表
+	MapWorks chan Work
+	// 未做的 reduce 任务列表
+	ReduceWorks chan Work
 	// 已经发送的任务列表，不确定是否能够做完
 	UnDoneWorks chan Work
-	// the number of reduce tasks to use.
-	NReduce int
 	// 所有工作都完成了吗
 	done bool
 }
@@ -100,65 +104,49 @@ func waitJob(m *Master, workType, workerId string) {
 	}
 
 }
-
-// Your code here -- RPC handlers for the worker to call.
-//
-// an example RPC handler.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-// Worker request a task to master
+func (m *Master) sendMap(work Work) (reply ReplyWorker) {
+	reply.Filename = work.FileName
+	file, err := os.Open(reply.Filename)
+	if err != nil {
+		log.Fatalf("cannot open %v", reply.Filename)
+	}
+	defer file.Close()
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		log.Fatalf("cannot read %v", reply.Filename)
+	}
+	reply.Content = string(content)
+	reply.WorkType = work.WorkType
+	reply.Id = work.WorkId
+	reply.Valid = true
+	return
+}
 func (m *Master) SendTask(args *Args, reply *ReplyWorker) error {
 	// 每次调用这个函数，只分配一个任务
-	// work := <-m.Works
+	for {
+		select {
+		case work := <-m.MapWorks:
+			*reply = m.sendMap(work)
 
-	for i := range m.nWorker {
-		if m.nWorker[i] == NotStarted {
-			// 发送任务时需要考虑并发，保证每个任务在同一时刻只能有一个 worker 在访问
-			m.mu.Lock()
-			m.nWorker[i] = InTheMid
-			m.mu.Unlock()
-			reply.Filename = m.files[i]
-			file, err := os.Open(reply.Filename)
-			if err != nil {
-				log.Fatalf("cannot open %v", reply.Filename)
+		case work := <-m.ReduceWorks:
+		priority:
+			for {
+				select {
+				case work := <-m.MapWorks:
+					*reply = m.sendMap(work)
+				default:
+					break priority
+				}
 			}
-			defer file.Close()
-			content, err := ioutil.ReadAll(file)
-			if err != nil {
-				log.Fatalf("cannot read %v", reply.Filename)
-			}
-			// 将id和对应的任务映射起来
-			m.taskMap[args.WorkerId] = i
-
-			reply.Content = string(content) // send all the doc.
-			reply.WorkType = "map"
-			reply.Id = i
-			reply.NReduce = m.nReduce
+			// deal with reduce
+			reply.WorkType = work.WorkType
+			reply.Id = work.WorkId
+			reply.MapWork = m.mapWork
 			reply.Valid = true
-
-			// 发射一个定时器，来检查 10 秒后任务是否完成，否则就任务这个 worker 挂掉了
-			go waitJob(m, "map", args.WorkerId)
-			return nil
+		default:
+			reply.Valid = false
 		}
 	}
-
-	// 如果到这一步，说明map任务都发送出去了
-	for k := 0; k < m.nReduce; k++ {
-		if m.reduceWork[k] == NotStarted {
-			m.taskMap[args.WorkerId] = k
-			reply.Valid = true
-			reply.WorkType = "reduce"
-			reply.Id = k
-			reply.NMap = len(m.files)
-			reply.NReduce = m.nReduce
-			m.reduceWork[k] = InTheMid
-			go waitJob(m, "reduce", args.WorkerId)
-			return nil
-		}
-	}
-	reply.Valid = false
-	return nil
 }
 
 //
@@ -196,14 +184,17 @@ func (m *Master) Done() bool {
 //
 func MakeMaster(files []string, nReduce int) *Master {
 	m := Master{}
+	m.MapWorks = make(chan Work, len(files))
+	m.ReduceWorks = make(chan Work, nReduce)
+	m.mapWork = len(files)
+	m.reduceWork = nReduce
 	for idx, file := range files {
 		work := Work{}
 		work.FileName = file
 		work.WorkId = idx
 		work.WorkType = "map"
-		m.Works <- work
+		m.MapWorks <- work
 	}
-	m.NReduce = nReduce
 	m.server()
 	return &m
 }

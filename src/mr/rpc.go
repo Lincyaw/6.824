@@ -38,10 +38,8 @@ type ReplyWorker struct {
 	Content string
 	// 任务，判断是map还是reduce
 	WorkType string
-	// 一共有几个reduce任务
-	NReduce int
 	// 一共有几个map任务
-	NMap int
+	MapWork int
 	// 当前是哪一个任务
 	Id int
 }
