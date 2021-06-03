@@ -7,18 +7,24 @@ import (
 	"net/rpc"
 	"os"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	log "github.com/sirupsen/logrus"
 )
 
+func init() {
+	log.SetLevel(log.ErrorLevel)
+}
+
+type WorkState int32
 type Master struct {
 	// 锁
 	mu sync.Mutex
 
-	mapWork    int
-	reduceWork int
+	mapWork     int
+	reduceWork  int
+	WorkState   []WorkState
+	FinishedMap int
 
 	// 未做的 map 任务列表
 	MapWorks chan Work
@@ -42,68 +48,62 @@ const (
 	Finish     = 2
 )
 
+func (m *Master) emitReduce() {
+	for i := 0; i < m.reduceWork; i++ {
+		work := Work{}
+		work.WorkId = m.mapWork + i
+		work.WorkType = "reduce"
+		m.ReduceWorks <- work
+		m.WorkState = append(m.WorkState, NotStarted)
+	}
+}
 func (m *Master) ReceiveStatus(args *WorkStatus, reply *ReplyWorker) error {
-	if args.WorkType == "map" {
-		if args.Done {
-			atomic.StoreInt32(&m.nWorker[m.taskMap[args.WorkerId]], Finish)
-			log.Info("Map", m.taskMap[args.WorkerId], " finished")
-		} else {
-			// 归零
-			atomic.StoreInt32(&m.nWorker[m.taskMap[args.WorkerId]], NotStarted)
-			log.Fatal("Map", m.taskMap[args.WorkerId], " failed")
+	if args.Done {
+		m.mu.Lock()
+		if m.WorkState[args.WorkId] == InTheMid {
+			m.WorkState[args.WorkId] = Finish
+			m.FinishedMap++
+			if m.FinishedMap == m.mapWork {
+				m.emitReduce()
+			}
+			if m.FinishedMap == m.mapWork+m.reduceWork {
+				m.done = true
+				log.Info("All Work finished.")
+			}
 		}
+		m.mu.Unlock()
 	} else {
-		if args.Done {
-			atomic.StoreInt32(&m.reduceWork[m.taskMap[args.WorkerId]], Finish)
-			log.Info("Reduce", m.taskMap[args.WorkerId], " finished")
+		if args.WorkType == "map" {
+			m.MapWorks <- args.Work
+			m.mu.Lock()
+			m.WorkState[args.WorkId] = NotStarted
+			m.mu.Unlock()
 		} else {
-			// 归零
-			atomic.StoreInt32(&m.reduceWork[m.taskMap[args.WorkerId]], NotStarted)
-			log.Fatal("Reduce", m.taskMap[args.WorkerId], " failed")
-		}
-	}
-	m.mu.Lock()
-	// Send map work first
-	for i := range m.nWorker {
-		if m.nWorker[i] != Finish {
+			m.ReduceWorks <- args.Work
+			m.mu.Lock()
+			m.WorkState[args.WorkId] = NotStarted
 			m.mu.Unlock()
-			return nil
 		}
 	}
-	for i := range m.reduceWork {
-		if m.reduceWork[i] != Finish {
-			m.mu.Unlock()
-			return nil
-		}
-
-	}
-	m.done = true
-	m.mu.Unlock()
 	return nil
 }
 
-func waitJob(m *Master, workType, workerId string) {
-	// 睡 10 s
-	mu := sync.Mutex{}
-	mu.Lock()
-	defer mu.Unlock()
-	time.Sleep(time.Duration(10) * time.Second)
-	switch workType {
-	case "map":
-		m.mu.Lock()
-		if m.nWorker[m.taskMap[workerId]] == InTheMid {
-			m.nWorker[m.taskMap[workerId]] = NotStarted
+func waitJob(m *Master, work Work) {
+	// 睡 8 s
+	time.Sleep(time.Duration(8) * time.Second)
+	m.mu.Lock()
+	log.Warn("length of workState: ", len(m.WorkState), " ,work id: ", work.WorkId)
+	if m.WorkState[work.WorkId] == InTheMid {
+		m.WorkState[work.WorkId] = NotStarted
+		if work.WorkType == "map" {
+			m.MapWorks <- work
+		} else {
+			m.ReduceWorks <- work
 		}
-		m.mu.Unlock()
-	case "reduce":
-		m.mu.Lock()
-		if m.reduceWork[m.taskMap[workerId]] == InTheMid {
-			m.reduceWork[m.taskMap[workerId]] = NotStarted
-		}
-		m.mu.Unlock()
 	}
-
+	m.mu.Unlock()
 }
+
 func (m *Master) sendMap(work Work) (reply ReplyWorker) {
 	reply.Filename = work.FileName
 	file, err := os.Open(reply.Filename)
@@ -119,34 +119,36 @@ func (m *Master) sendMap(work Work) (reply ReplyWorker) {
 	reply.WorkType = work.WorkType
 	reply.Id = work.WorkId
 	reply.Valid = true
+	reply.ReduceWork = m.reduceWork
 	return
 }
 func (m *Master) SendTask(args *Args, reply *ReplyWorker) error {
 	// 每次调用这个函数，只分配一个任务
-	for {
-		select {
-		case work := <-m.MapWorks:
-			*reply = m.sendMap(work)
+	select {
+	case work := <-m.MapWorks:
+		log.Info("map, ", work)
+		*reply = m.sendMap(work)
+		m.mu.Lock()
+		m.WorkState[work.WorkId] = InTheMid
+		m.mu.Unlock()
+		go waitJob(m, work)
+	case work := <-m.ReduceWorks:
+		log.Info("reduce, ", work)
 
-		case work := <-m.ReduceWorks:
-		priority:
-			for {
-				select {
-				case work := <-m.MapWorks:
-					*reply = m.sendMap(work)
-				default:
-					break priority
-				}
-			}
-			// deal with reduce
-			reply.WorkType = work.WorkType
-			reply.Id = work.WorkId
-			reply.MapWork = m.mapWork
-			reply.Valid = true
-		default:
-			reply.Valid = false
-		}
+		// deal with reduce
+		reply.WorkType = work.WorkType
+		reply.Id = work.WorkId
+		reply.MapWork = m.mapWork
+		reply.Valid = true
+		m.mu.Lock()
+		m.WorkState[work.WorkId] = InTheMid
+		m.mu.Unlock()
+		go waitJob(m, work)
+
+	default:
+		reply.Valid = false
 	}
+	return nil
 }
 
 //
@@ -184,16 +186,19 @@ func (m *Master) Done() bool {
 //
 func MakeMaster(files []string, nReduce int) *Master {
 	m := Master{}
+	log.Info("init")
 	m.MapWorks = make(chan Work, len(files))
 	m.ReduceWorks = make(chan Work, nReduce)
 	m.mapWork = len(files)
 	m.reduceWork = nReduce
+	m.FinishedMap = 0
 	for idx, file := range files {
 		work := Work{}
 		work.FileName = file
 		work.WorkId = idx
 		work.WorkType = "map"
 		m.MapWorks <- work
+		m.WorkState = append(m.WorkState, NotStarted)
 	}
 	m.server()
 	return &m

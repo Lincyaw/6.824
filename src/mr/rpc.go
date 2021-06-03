@@ -39,15 +39,14 @@ type ReplyWorker struct {
 	// 任务，判断是map还是reduce
 	WorkType string
 	// 一共有几个map任务
-	MapWork int
+	MapWork    int
+	ReduceWork int
 	// 当前是哪一个任务
 	Id int
 }
-
 type WorkStatus struct {
-	WorkerId string
-	WorkType string
-	Done     bool
+	Work
+	Done bool
 }
 
 // Cook up a unique-ish UNIX-domain socket name

@@ -5,12 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
-	"log"
 	"net/rpc"
 	"os"
 	"sort"
 	"strconv"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 )
 
 //
@@ -62,16 +63,15 @@ func Worker(mapf func(string, string) []KeyValue,
 	reply := ReplyWorker{}
 	// send the RPC request, wait for the reply.
 	ret := call("Master.SendTask", &args, &reply)
-	if ret == false {
+	if !ret {
 		return
 	}
 	// 如果任务一直有效，则一直干活
 	for reply.Valid {
-		workArgs := WorkStatus{
-			WorkerId: args.WorkerId,
-			WorkType: reply.WorkType,
-			Done:     false,
-		}
+		log.Info("work id = ", reply.Id, ", work type = ", reply.WorkType)
+		workArgs := WorkStatus{}
+		workArgs.WorkType = reply.WorkType
+		workArgs.WorkId = reply.Id
 		if reply.WorkType == "map" {
 			if MapWork(mapf, reply) {
 				workArgs.Done = true
@@ -82,26 +82,25 @@ func Worker(mapf func(string, string) []KeyValue,
 			}
 		}
 		ret = call("Master.ReceiveStatus", &workArgs, &reply)
-		if ret == false {
+		if !ret {
 			return
 		}
-		time.Sleep(time.Duration(1) * time.Second)
+		time.Sleep(time.Duration(10) * time.Millisecond)
 		// Current work finished, request a new work.
 		reply = ReplyWorker{}
 		ret = call("Master.SendTask", &args, &reply)
-		if ret == false {
+		if !ret {
 			return
 		}
-		//fmt.Println("Work is valid? ", reply.Valid)
 	}
 }
 func MapWork(mapf func(string, string) []KeyValue, reply ReplyWorker) bool {
 	kvs := mapf(reply.Filename, reply.Content)
 	// 二维的kv, 即 nReduce 个桶
-	reduces := make([][]KeyValue, reply.NReduce)
+	reduces := make([][]KeyValue, reply.ReduceWork)
 	// 将结果分到 nReduce 个桶中
 	for _, kv := range kvs {
-		idx := ihash(kv.Key) % reply.NReduce
+		idx := ihash(kv.Key) % reply.ReduceWork
 		reduces[idx] = append(reduces[idx], kv)
 	}
 	// Intermediate format: mr-sourceFileId-targetFileId
@@ -133,8 +132,8 @@ func MapWork(mapf func(string, string) []KeyValue, reply ReplyWorker) bool {
 func ReduceWork(reducef func(string, []string) string, reply ReplyWorker) bool {
 	var intermediate []KeyValue
 	// this worker need to deal with the "reply.Id" reduce work.
-	for n := 0; n < reply.NMap; n++ {
-		fileName := "mr-" + strconv.Itoa(n) + "-" + strconv.Itoa(reply.Id)
+	for n := 0; n < reply.MapWork; n++ {
+		fileName := "mr-" + strconv.Itoa(n) + "-" + strconv.Itoa(reply.Id-reply.MapWork)
 		f, err := os.Open(fileName)
 		defer f.Close()
 		if err != nil {
@@ -152,7 +151,7 @@ func ReduceWork(reducef func(string, []string) string, reply ReplyWorker) bool {
 	}
 	sort.Sort(ByKey(intermediate))
 	i := 0
-	ofile, err := os.Create("mr-out-" + strconv.Itoa(reply.Id))
+	ofile, err := os.Create("mr-out-" + strconv.Itoa(reply.Id-reply.MapWork))
 	if err != nil {
 		log.Println("Unable to create file, ", err)
 		return false
