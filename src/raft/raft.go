@@ -61,7 +61,8 @@ const (
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
+	mu        sync.Mutex // Lock to protect shared access to this peer's state
+	voteLock  sync.Mutex
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
@@ -131,7 +132,7 @@ type Log struct {
 }
 
 func init() {
-	log.SetLevel(log.WarnLevel)
+	log.SetLevel(log.FatalLevel)
 }
 
 // return currentTerm and whether this server
@@ -223,13 +224,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term >= int(rf.Term) && args.LastLogIndex >= len(rf.Logs) {
 		reply.VoteGranted = true
 		reply.Term = args.Term
-		log.Warn(rf.me, " 收到了 ", args.CandidateId, " 的选举请求, 并且同意了")
+		log.Trace(rf.me, " 收到了 ", args.CandidateId, " 的选举请求, 并且同意了")
 	} else {
 		reply.VoteGranted = false
 		reply.Term = int(rf.Term)
-		log.Warn(rf.me, " 收到了 ", args.CandidateId, " 的选举请求, 但不同意")
+		log.Trace(rf.me, " 收到了 ", args.CandidateId, " 的选举请求, 但不同意")
 	}
-	rf.mu.Lock()
+	rf.mu.Unlock()
 }
 
 //
@@ -261,10 +262,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 //
-// func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-// 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-// 	return ok
-// }
+func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	return ok
+}
 
 type AppendEntriesArgs struct {
 	// leader's term
@@ -281,16 +282,18 @@ type AppendEntriesReply struct {
 
 // 心跳通知、日志追加 RPC
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	log.Warn("收到 id ", args.LeaderId, "的心跳请求，其任期为 ", args.Term, " 自己的任期为 ", rf.Term)
+	log.Trace(rf.me, " 收到 id ", args.LeaderId, "的心跳请求，其任期为 ", args.Term, " 自己的任期为 ", rf.Term)
+	rf.mu.Lock()
 	if args.Term < int(rf.Term) {
 		reply.Success = false
-		rf.mu.Lock()
 		reply.Term = int(rf.Term)
-		rf.mu.Unlock()
 		rf.receiveHeartBeat = true
 		rf.leaderBeforeTimeOut = true
-		return
+	} else {
+		rf.Term = int32(args.Term)
+		rf.CurrentState = FOLLOWER
 	}
+	rf.mu.Unlock()
 }
 
 //
@@ -371,7 +374,9 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 
 	// 启动心跳计时器，超时则发起选举，自己变成候选人状态
 	ctx := context.Background()
-	go rf.CheckHeartBeatsClock(ctx, rand.Intn(500)+2000)
+	go rf.CheckHeartBeatsClock(ctx, rand.Intn(500)+1000)
+	go rf.SendHearBeatsClock(ctx)
+	go rf.startVote()
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
@@ -379,63 +384,69 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 }
 
 func (rf *Raft) startVote() {
-	log.Warn("id ", rf.me, " 开始选举")
-
-	// 自增任期号
-	rf.mu.Lock()
-	rf.Term++
-	rf.mu.Unlock()
-	// 自己给自己投票
-	cnt := 1
-	// 转换自己的状态为 Candicater
-	atomic.StoreInt32(&rf.CurrentState, CANDICATER)
-
-	args := RequestVoteArgs{}
-	args.CandidateId = rf.me
-	args.Term = int(rf.Term)
-	args.LastLogIndex = len(rf.Logs)
-	args.LastLogTerm = rf.Logs[len(rf.Logs)-1].Term
-	// todo: 添加剩余的参数
-	replies := make([]RequestVoteReply, len(rf.peers))
-
-	log.Trace("raft 对象信息", rf)
-	log.Trace("发送的选举消息:", args)
-
-	// 在这里发起一次选举，向所有的 server 发送选举请求
-	ctx := context.Background()
-	go rf.ElectionClock(ctx, rand.Intn(400)+900)
-
-	for idx, server := range rf.peers {
-		if idx != rf.me {
-			log.Error("遍历到 ", idx, " 了！！！")
-			replies[idx] = RequestVoteReply{}
-			log.Warn(rf.me, " 向 ", idx, " 发送了选举请求")
-			ok := server.Call("Raft.RequestVote", &args, &(replies[idx]))
-			if !ok {
-				log.Error("RNM, RPC挂了")
-			}
-			log.Error("收到的选举回复, Term:", replies[idx].Term, ", Agree? ", replies[idx].VoteGranted)
+	log.Trace("id ", rf.me, " 开始选举")
+	for {
+		if rf.CurrentState != CANDICATER {
+			continue
 		}
-	}
-	log.Error("Here")
+		// 自增任期号
+		rf.mu.Lock()
+		rf.Term++
+		rf.mu.Unlock()
+		// 自己给自己投票
+		cnt := 1
 
-	for idx, v := range replies {
-		if idx != rf.me {
-			if v.VoteGranted {
-				cnt++
-			}
-			if v.Term > int(rf.Term) {
-				rf.mu.Lock()
-				rf.Term = int32(v.Term)
-				rf.mu.Unlock()
+		args := RequestVoteArgs{}
+		args.CandidateId = rf.me
+		args.Term = int(rf.Term)
+		args.LastLogIndex = len(rf.Logs)
+		args.LastLogTerm = rf.Logs[len(rf.Logs)-1].Term
+		// todo: 添加剩余的参数
+		replies := make([]RequestVoteReply, len(rf.peers))
+
+		log.Trace("raft 对象信息", rf)
+		log.Trace("发送的选举消息:", args)
+
+		// 在这里发起一次选举，向所有的 server 发送选举请求
+		ctx := context.Background()
+		go rf.ElectionClock(ctx, rand.Intn(400)+1000)
+
+		for idx, server := range rf.peers {
+			if idx != rf.me {
+				log.Trace(rf.me, " 遍历到 ", idx, " 了！！！")
+				replies[idx] = RequestVoteReply{}
+				log.Trace(rf.me, " 向 ", idx, " 发送了选举请求")
+				ok := server.Call("Raft.RequestVote", &args, &(replies[idx]))
+				if !ok {
+					log.Error(rf.me, "给 ", idx, " 发的选举没有得到回复")
+				}
+				log.Trace("收到的选举回复, Term:", replies[idx].Term, ", Agree? ", replies[idx].VoteGranted)
 			}
 		}
-	}
-	log.Warn("id ", rf.me, "获得选票", cnt, "张，总共有", len(rf.peers), "人")
-	if cnt > len(rf.peers)/2 {
-		rf.CurrentState = LEADER
-	} else {
-		rf.CurrentState = CANDICATER
+
+		for idx, v := range replies {
+			if idx != rf.me {
+				if v.VoteGranted {
+					cnt++
+				}
+				if v.Term > int(rf.Term) {
+					rf.mu.Lock()
+					rf.Term = int32(v.Term)
+					rf.CurrentState = FOLLOWER
+					rf.mu.Unlock()
+					log.Info("id ", rf.me, "选举失败, 收到的任期号为 ", v.Term, ", 自己的任期号为", rf.Term)
+					return
+				}
+			}
+		}
+		log.Trace("id ", rf.me, "获得选票", cnt, "张，总共有", len(rf.peers), "人")
+		rf.mu.Lock()
+		if cnt > len(rf.peers)/2 {
+			rf.CurrentState = LEADER
+		} else {
+			rf.CurrentState = CANDICATER
+		}
+		rf.mu.Unlock()
 	}
 }
 
@@ -444,17 +455,24 @@ func (rf *Raft) startVote() {
 // 超时 timeout ms
 func (rf *Raft) CheckHeartBeatsClock(ctx context.Context, timeout int) {
 	for {
+		if rf.CurrentState == LEADER {
+			continue
+		}
 		select {
+
 		default:
 			// 初始化标志位
 			rf.mu.Lock()
 			rf.receiveHeartBeat = false
 			rf.mu.Unlock()
+
 			time.Sleep(time.Duration(timeout) * time.Millisecond)
 
-			// 自己不是 leader && 没收到心跳
-			if rf.CurrentState != LEADER && !rf.receiveHeartBeat {
-				rf.startVote()
+			// 没收到心跳
+			if !rf.receiveHeartBeat {
+				rf.mu.Lock()
+				rf.CurrentState = CANDICATER
+				rf.mu.Unlock()
 			}
 		case <-ctx.Done():
 			return
@@ -474,10 +492,12 @@ func (rf *Raft) ElectionClock(ctx context.Context, timeout int) {
 		time.Sleep(time.Duration(timeout) * time.Millisecond)
 		// 没产生 leader
 		if !rf.leaderBeforeTimeOut {
-			log.Warn("id ", rf.me, " 选举超时")
+			log.Info("id ", rf.me, " 选举超时")
 			sleepTime := rand.Intn(200)
 			time.Sleep(time.Duration(sleepTime) * time.Millisecond)
-			rf.startVote()
+			rf.mu.Lock()
+			rf.CurrentState = CANDICATER
+			rf.mu.Unlock()
 		}
 	case <-ctx.Done():
 		return
@@ -487,6 +507,9 @@ func (rf *Raft) ElectionClock(ctx context.Context, timeout int) {
 // 发送心跳计时器
 func (rf *Raft) SendHearBeatsClock(ctx context.Context) {
 	for {
+		if rf.CurrentState != LEADER {
+			continue
+		}
 		select {
 		default:
 			args := AppendEntriesArgs{}
@@ -498,15 +521,17 @@ func (rf *Raft) SendHearBeatsClock(ctx context.Context) {
 					replies[idx] = AppendEntriesReply{}
 					ok := server.Call("Raft.AppendEntries", &args, &(replies[idx]))
 					if !ok {
-						log.Error("RNM, RPC挂了")
+						log.Error(rf.me, "给 ", idx, " 发的心跳没有得到回复")
 					}
 					if replies[idx].Term > int(rf.Term) {
-						atomic.StoreInt32(&rf.Term, int32(replies[idx].Term))
-						atomic.StoreInt32(&rf.CurrentState, FOLLOWER)
+						rf.mu.Lock()
+						rf.Term = int32(replies[idx].Term)
+						rf.CurrentState = FOLLOWER
+						rf.mu.Unlock()
 					}
 				}
 			}
-			time.Sleep(time.Duration(120) * time.Millisecond)
+			time.Sleep(time.Duration(150) * time.Millisecond)
 		case <-ctx.Done():
 			return
 		}
