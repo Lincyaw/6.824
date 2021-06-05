@@ -138,14 +138,8 @@ func init() {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	// var term int
-	var isleader bool
 	// Your code here (2A).
-	if rf.CurrentState == LEADER {
-		isleader = true
-	}
-	return int(rf.Term), isleader
+	return int(rf.Term), rf.CurrentState == LEADER
 }
 
 //
@@ -262,10 +256,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 //
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
-}
+// func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+// 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+// 	return ok
+// }
 
 type AppendEntriesArgs struct {
 	// leader's term
@@ -285,12 +279,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	log.Trace(rf.me, " 收到 id ", args.LeaderId, "的心跳请求，其任期为 ", args.Term, " 自己的任期为 ", rf.Term)
 	rf.mu.Lock()
 	if args.Term < int(rf.Term) {
+		// 自己的任期号比发来的心跳的大
 		reply.Success = false
 		reply.Term = int(rf.Term)
-		rf.receiveHeartBeat = true
-		rf.leaderBeforeTimeOut = true
 	} else {
+		reply.Success = true
 		rf.Term = int32(args.Term)
+		rf.receiveHeartBeat = true
 		rf.CurrentState = FOLLOWER
 	}
 	rf.mu.Unlock()
@@ -408,8 +403,6 @@ func (rf *Raft) startVote() {
 		log.Trace("发送的选举消息:", args)
 
 		// 在这里发起一次选举，向所有的 server 发送选举请求
-		ctx := context.Background()
-		go rf.ElectionClock(ctx, rand.Intn(400)+1000)
 
 		for idx, server := range rf.peers {
 			if idx != rf.me {
@@ -432,6 +425,7 @@ func (rf *Raft) startVote() {
 				if v.Term > int(rf.Term) {
 					rf.mu.Lock()
 					rf.Term = int32(v.Term)
+					// 这里可以直接变成 follower，因为就算所有的服务器都是 follower，他们也会因为心跳超时而重新发起一轮选举
 					rf.CurrentState = FOLLOWER
 					rf.mu.Unlock()
 					log.Info("id ", rf.me, "选举失败, 收到的任期号为 ", v.Term, ", 自己的任期号为", rf.Term)
@@ -444,7 +438,9 @@ func (rf *Raft) startVote() {
 		if cnt > len(rf.peers)/2 {
 			rf.CurrentState = LEADER
 		} else {
+			// 没有当选成功，并且自己也没有变成 follower，则继续选举，并且设置一定的超时时间，防止多数服务器同时又开始一轮选举
 			rf.CurrentState = CANDICATER
+			time.Sleep((time.Duration(500) * time.Millisecond))
 		}
 		rf.mu.Unlock()
 	}
@@ -481,30 +477,32 @@ func (rf *Raft) CheckHeartBeatsClock(ctx context.Context, timeout int) {
 }
 
 // 选举超时计时器
-func (rf *Raft) ElectionClock(ctx context.Context, timeout int) {
-	select {
-	default:
-		// 初始化标志位
-		rf.mu.Lock()
-		rf.leaderBeforeTimeOut = false
-		rf.mu.Unlock()
+// 首先重置 选举完成 标志位，然后睡眠 timeout 的时间。睡醒之后如果发现已经有 leader 产生
+// func (rf *Raft) ElectionClock(ctx context.Context, timeout int) {
+// 	select {
+// 	default:
+// 		// 初始化标志位
+// 		rf.mu.Lock()
+// 		rf.leaderBeforeTimeOut = false
+// 		rf.mu.Unlock()
 
-		time.Sleep(time.Duration(timeout) * time.Millisecond)
-		// 没产生 leader
-		if !rf.leaderBeforeTimeOut {
-			log.Info("id ", rf.me, " 选举超时")
-			sleepTime := rand.Intn(200)
-			time.Sleep(time.Duration(sleepTime) * time.Millisecond)
-			rf.mu.Lock()
-			rf.CurrentState = CANDICATER
-			rf.mu.Unlock()
-		}
-	case <-ctx.Done():
-		return
-	}
-}
+// 		time.Sleep(time.Duration(timeout) * time.Millisecond)
+// 		// 没产生 leader
+// 		// if !rf.leaderBeforeTimeOut {
+// 		// 	log.Info("id ", rf.me, " 选举超时")
+// 		// 	sleepTime := rand.Intn(200)
+// 		// 	time.Sleep(time.Duration(sleepTime) * time.Millisecond)
+// 		// 	rf.mu.Lock()
+// 		// 	rf.CurrentState = CANDICATER
+// 		// 	rf.mu.Unlock()
+// 		// }
+// 	case <-ctx.Done():
+// 		return
+// 	}
+// }
 
-// 发送心跳计时器
+// 发送心跳计时器  master -> follower
+// 每 150ms 向所有的服务器发送心跳，如果返回的心跳 Term 比自己大，则把自己的状态转变为 Follower，然后退出向所有服务器发送心跳的循环
 func (rf *Raft) SendHearBeatsClock(ctx context.Context) {
 	for {
 		if rf.CurrentState != LEADER {
@@ -528,6 +526,7 @@ func (rf *Raft) SendHearBeatsClock(ctx context.Context) {
 						rf.Term = int32(replies[idx].Term)
 						rf.CurrentState = FOLLOWER
 						rf.mu.Unlock()
+						goto CON
 					}
 				}
 			}
@@ -535,5 +534,6 @@ func (rf *Raft) SendHearBeatsClock(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		}
+	CON:
 	}
 }
