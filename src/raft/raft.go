@@ -52,9 +52,9 @@ type ApplyMsg struct {
 }
 
 const (
-	FOLLOWER   = 1
-	CANDICATER = 2
-	LEADER     = 3
+	FOLLOWER   int32 = 1
+	CANDICATER int32 = 2
+	LEADER     int32 = 3
 )
 
 //
@@ -132,7 +132,7 @@ type Log struct {
 }
 
 func init() {
-	log.SetLevel(log.FatalLevel)
+	log.SetLevel(log.DebugLevel)
 }
 
 // return currentTerm and whether this server
@@ -369,9 +369,13 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 
 	// 启动心跳计时器，超时则发起选举，自己变成候选人状态
 	ctx := context.Background()
-	go rf.CheckHeartBeatsClock(ctx, rand.Intn(500)+1000)
+	// follower
+	go rf.CheckHeartBeatsClock(ctx, rand.Intn(500)+500)
+	// leader
 	go rf.SendHearBeatsClock(ctx)
+	// candicator
 	go rf.startVote()
+
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
@@ -379,11 +383,15 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 }
 
 func (rf *Raft) startVote() {
-	log.Trace("id ", rf.me, " 开始选举")
 	for {
+		rf.mu.Lock()
 		if rf.CurrentState != CANDICATER {
+			rf.mu.Unlock()
 			continue
 		}
+		rf.mu.Unlock()
+
+		log.Debug("id ", rf.me, " 开始选举 ", rf.CurrentState)
 		// 自增任期号
 		rf.mu.Lock()
 		rf.Term++
@@ -403,7 +411,6 @@ func (rf *Raft) startVote() {
 		log.Trace("发送的选举消息:", args)
 
 		// 在这里发起一次选举，向所有的 server 发送选举请求
-
 		for idx, server := range rf.peers {
 			if idx != rf.me {
 				log.Trace(rf.me, " 遍历到 ", idx, " 了！！！")
@@ -433,16 +440,17 @@ func (rf *Raft) startVote() {
 				}
 			}
 		}
-		log.Trace("id ", rf.me, "获得选票", cnt, "张，总共有", len(rf.peers), "人")
+		log.Debug("id ", rf.me, "获得选票", cnt, "张，总共有", len(rf.peers), "人")
 		rf.mu.Lock()
 		if cnt > len(rf.peers)/2 {
 			rf.CurrentState = LEADER
+			rf.mu.Unlock()
 		} else {
 			// 没有当选成功，并且自己也没有变成 follower，则继续选举，并且设置一定的超时时间，防止多数服务器同时又开始一轮选举
 			rf.CurrentState = CANDICATER
-			time.Sleep((time.Duration(500) * time.Millisecond))
+			rf.mu.Unlock()
+			time.Sleep((time.Duration(200) * time.Millisecond))
 		}
-		rf.mu.Unlock()
 	}
 }
 
@@ -454,8 +462,8 @@ func (rf *Raft) CheckHeartBeatsClock(ctx context.Context, timeout int) {
 		if rf.CurrentState == LEADER {
 			continue
 		}
+		// log.Debug("id ", rf.me, " 收到心跳 ", rf.CurrentState)
 		select {
-
 		default:
 			// 初始化标志位
 			rf.mu.Lock()
@@ -465,41 +473,18 @@ func (rf *Raft) CheckHeartBeatsClock(ctx context.Context, timeout int) {
 			time.Sleep(time.Duration(timeout) * time.Millisecond)
 
 			// 没收到心跳
+			rf.mu.Lock()
 			if !rf.receiveHeartBeat {
-				rf.mu.Lock()
 				rf.CurrentState = CANDICATER
-				rf.mu.Unlock()
+			} else {
+				rf.CurrentState = FOLLOWER
 			}
+			rf.mu.Unlock()
 		case <-ctx.Done():
 			return
 		}
 	}
 }
-
-// 选举超时计时器
-// 首先重置 选举完成 标志位，然后睡眠 timeout 的时间。睡醒之后如果发现已经有 leader 产生
-// func (rf *Raft) ElectionClock(ctx context.Context, timeout int) {
-// 	select {
-// 	default:
-// 		// 初始化标志位
-// 		rf.mu.Lock()
-// 		rf.leaderBeforeTimeOut = false
-// 		rf.mu.Unlock()
-
-// 		time.Sleep(time.Duration(timeout) * time.Millisecond)
-// 		// 没产生 leader
-// 		// if !rf.leaderBeforeTimeOut {
-// 		// 	log.Info("id ", rf.me, " 选举超时")
-// 		// 	sleepTime := rand.Intn(200)
-// 		// 	time.Sleep(time.Duration(sleepTime) * time.Millisecond)
-// 		// 	rf.mu.Lock()
-// 		// 	rf.CurrentState = CANDICATER
-// 		// 	rf.mu.Unlock()
-// 		// }
-// 	case <-ctx.Done():
-// 		return
-// 	}
-// }
 
 // 发送心跳计时器  master -> follower
 // 每 150ms 向所有的服务器发送心跳，如果返回的心跳 Term 比自己大，则把自己的状态转变为 Follower，然后退出向所有服务器发送心跳的循环
@@ -508,6 +493,7 @@ func (rf *Raft) SendHearBeatsClock(ctx context.Context) {
 		if rf.CurrentState != LEADER {
 			continue
 		}
+		log.Debug("id ", rf.me, " 发送心跳")
 		select {
 		default:
 			args := AppendEntriesArgs{}

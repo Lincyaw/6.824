@@ -239,3 +239,13 @@ Action:
 Identify and stop the process that's listening on port 9221 or configure this application to listen on another port.
 
 2021-06-05 10:20:34.363  INFO 104480 --- [main] o.s.s.concurrent.ThreadPoolTaskExecutor  : Shutting down ExecutorService 'applicationTaskExecutor'
+2021-06-05 16:16:53.311 DEBUG 91874 --- [http-nio-9221-exec-6] o.s.web.servlet.DispatcherServlet        : GET "/v1/scanRules", parameters={}
+2021-06-05 16:16:53.390 DEBUG 91874 --- [http-nio-9221-exec-6] s.w.s.m.m.a.RequestMappingHandlerMapping : Mapped to com.hcl.appscan.customscannersservice.controller.CustomScannersController#getScanRules(String[])
+2021-06-05 16:16:53.458 DEBUG 91874 --- [http-nio-9221-exec-6] o.s.w.s.m.m.a.HttpEntityMethodProcessor  : Using 'application/json', given [application/json] and supported [application/json]
+2021-06-05 16:16:53.526 DEBUG 91874 --- [http-nio-9221-exec-6] o.s.w.s.m.m.a.HttpEntityMethodProcessor  : Writing [{Golang={com.ouncelabs.languagelite.golang.rules.CommMisconfig=CustomScannersServiceScanRule{ruleNam (truncated)...]
+2021-06-05 16:16:53.692 DEBUG 91874 --- [http-nio-9221-exec-6] o.s.web.servlet.DispatcherServlet        : Completed 200 OK
+2021-06-05 16:16:54.190 DEBUG 91874 --- [http-nio-9221-exec-7] o.s.web.servlet.DispatcherServlet        : GET "/v1/scanRules", parameters={}
+2021-06-05 16:16:54.192 DEBUG 91874 --- [http-nio-9221-exec-7] s.w.s.m.m.a.RequestMappingHandlerMapping : Mapped to com.hcl.appscan.customscannersservice.controller.CustomScannersController#getScanRules(String[])
+2021-06-05 16:16:54.195 DEBUG 91874 --- [http-nio-9221-exec-7] o.s.w.s.m.m.a.HttpEntityMethodProcessor  : Using 'application/json', given [application/json] and supported [application/json]
+2021-06-05 16:16:54.202 DEBUG 91874 --- [http-nio-9221-exec-7] o.s.w.s.m.m.a.HttpEntityMethodProcessor  : Writing [{Golang={com.ouncelabs.languagelite.golang.rules.CommMisconfig=CustomScannersServiceScanRule{ruleNam (truncated)...]
+2021-06-05 16:16:54.208 DEBUG 91874 --- [http-nio-9221-exec-7] o.s.web.servlet.DispatcherServlet        : Completed 200 OK
