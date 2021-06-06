@@ -132,7 +132,7 @@ type Log struct {
 }
 
 func init() {
-	log.SetLevel(log.DebugLevel)
+	log.SetLevel(log.FatalLevel)
 }
 
 // return currentTerm and whether this server
@@ -370,7 +370,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	// 启动心跳计时器，超时则发起选举，自己变成候选人状态
 	ctx := context.Background()
 	// follower
-	go rf.CheckHeartBeatsClock(ctx, rand.Intn(500)+500)
+	go rf.CheckHeartBeatsClock(ctx, rand.Intn(100)+200)
 	// leader
 	go rf.SendHearBeatsClock(ctx)
 	// candicator
@@ -459,10 +459,6 @@ func (rf *Raft) startVote() {
 // 超时 timeout ms
 func (rf *Raft) CheckHeartBeatsClock(ctx context.Context, timeout int) {
 	for {
-		if rf.CurrentState == LEADER {
-			continue
-		}
-		// log.Debug("id ", rf.me, " 收到心跳 ", rf.CurrentState)
 		select {
 		default:
 			// 初始化标志位
@@ -475,7 +471,9 @@ func (rf *Raft) CheckHeartBeatsClock(ctx context.Context, timeout int) {
 			// 没收到心跳
 			rf.mu.Lock()
 			if !rf.receiveHeartBeat {
-				rf.CurrentState = CANDICATER
+				if rf.CurrentState != LEADER {
+					rf.CurrentState = CANDICATER
+				}
 			} else {
 				rf.CurrentState = FOLLOWER
 			}
@@ -500,11 +498,14 @@ func (rf *Raft) SendHearBeatsClock(ctx context.Context) {
 			args.Term = int(rf.Term)
 			args.LeaderId = rf.me
 			replies := make([]AppendEntriesReply, len(rf.peers))
+
+			replyNumber := 0
 			for idx, server := range rf.peers {
 				if idx != rf.me {
 					replies[idx] = AppendEntriesReply{}
 					ok := server.Call("Raft.AppendEntries", &args, &(replies[idx]))
 					if !ok {
+						replyNumber++
 						log.Error(rf.me, "给 ", idx, " 发的心跳没有得到回复")
 					}
 					if replies[idx].Term > int(rf.Term) {
@@ -516,6 +517,11 @@ func (rf *Raft) SendHearBeatsClock(ctx context.Context) {
 					}
 				}
 			}
+			// if replyNumber <= len(rf.peers)/2 {
+			// 	rf.mu.Lock()
+			// 	rf.CurrentState = FOLLOWER
+			// 	rf.mu.Unlock()
+			// }
 			time.Sleep(time.Duration(150) * time.Millisecond)
 		case <-ctx.Done():
 			return
