@@ -82,9 +82,8 @@ type Raft struct {
 	MatchIndex []int
 
 	// 我自己添加的状态
-	CurrentState        int32 // 当前的状态
-	receiveHeartBeat    bool  // 在定时器超时之前是否收到了心跳
-	leaderBeforeTimeOut bool  // 在选举定时器超时之前是否产生了 leader
+	CurrentState     int32 // 当前的状态
+	receiveHeartBeat bool  // 在定时器超时之前是否收到了心跳
 }
 
 func (rf *Raft) String() string {
@@ -132,7 +131,7 @@ type Log struct {
 }
 
 func init() {
-	log.SetLevel(log.FatalLevel)
+	log.SetLevel(log.ErrorLevel)
 }
 
 // return currentTerm and whether this server
@@ -359,9 +358,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.Term = 0
 	rf.CurrentState = FOLLOWER
-	rf.leaderBeforeTimeOut = false
 	rf.receiveHeartBeat = false
-	rf.leaderBeforeTimeOut = false
 	rf.Logs = append(rf.Logs, Log{
 		Term:    0,
 		Command: "Init",
@@ -370,7 +367,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	// 启动心跳计时器，超时则发起选举，自己变成候选人状态
 	ctx := context.Background()
 	// follower
-	go rf.CheckHeartBeatsClock(ctx, rand.Intn(100)+200)
+	go rf.CheckHeartBeatsClock(ctx, rand.Intn(200)+200)
 	// leader
 	go rf.SendHearBeatsClock(ctx)
 	// candicator
@@ -419,6 +416,7 @@ func (rf *Raft) startVote() {
 				ok := server.Call("Raft.RequestVote", &args, &(replies[idx]))
 				if !ok {
 					log.Error(rf.me, "给 ", idx, " 发的选举没有得到回复")
+					continue
 				}
 				log.Trace("收到的选举回复, Term:", replies[idx].Term, ", Agree? ", replies[idx].VoteGranted)
 			}
@@ -499,14 +497,15 @@ func (rf *Raft) SendHearBeatsClock(ctx context.Context) {
 			args.LeaderId = rf.me
 			replies := make([]AppendEntriesReply, len(rf.peers))
 
-			replyNumber := 0
+			noReplyNumber := 0
 			for idx, server := range rf.peers {
 				if idx != rf.me {
 					replies[idx] = AppendEntriesReply{}
 					ok := server.Call("Raft.AppendEntries", &args, &(replies[idx]))
 					if !ok {
-						replyNumber++
+						noReplyNumber++
 						log.Error(rf.me, "给 ", idx, " 发的心跳没有得到回复")
+						continue
 					}
 					if replies[idx].Term > int(rf.Term) {
 						rf.mu.Lock()
@@ -517,10 +516,12 @@ func (rf *Raft) SendHearBeatsClock(ctx context.Context) {
 					}
 				}
 			}
-			// if replyNumber <= len(rf.peers)/2 {
+			// if noReplyNumber > len(rf.peers)/2 {
+			// 	log.Error(rf.me, "发送的心跳有", noReplyNumber, "人都没有回复")
 			// 	rf.mu.Lock()
 			// 	rf.CurrentState = FOLLOWER
 			// 	rf.mu.Unlock()
+			// 	goto CON
 			// }
 			time.Sleep(time.Duration(150) * time.Millisecond)
 		case <-ctx.Done():
