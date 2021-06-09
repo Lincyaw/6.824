@@ -23,12 +23,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"../labrpc"
-	log "github.com/sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 )
 
 // import "bytes"
@@ -130,8 +131,18 @@ type Log struct {
 	Command string
 }
 
+var logger *logrus.Logger
+
 func init() {
-	log.SetLevel(log.ErrorLevel)
+	logger = logrus.New()
+
+	file, err := os.OpenFile("logs/"+time.Now().Format(time.UnixDate)+".log", os.O_CREATE|os.O_WRONLY, 0666)
+	if err == nil {
+		logger.Out = file
+	} else {
+		logger.Info("Failed to log to file, using default stderr")
+	}
+	logger.SetLevel(logrus.TraceLevel)
 }
 
 // return currentTerm and whether this server
@@ -217,11 +228,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term >= int(rf.Term) && args.LastLogIndex >= len(rf.Logs) {
 		reply.VoteGranted = true
 		reply.Term = args.Term
-		log.Trace(rf.me, " 收到了 ", args.CandidateId, " 的选举请求, 并且同意了")
+		logger.Trace(rf.me, " 收到了 ", args.CandidateId, " 的选举请求, 并且同意了")
 	} else {
 		reply.VoteGranted = false
 		reply.Term = int(rf.Term)
-		log.Trace(rf.me, " 收到了 ", args.CandidateId, " 的选举请求, 但不同意")
+		logger.Trace(rf.me, " 收到了 ", args.CandidateId, " 的选举请求, 但不同意")
 	}
 	rf.mu.Unlock()
 }
@@ -275,7 +286,7 @@ type AppendEntriesReply struct {
 
 // 心跳通知、日志追加 RPC
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	log.Trace(rf.me, " 收到 id ", args.LeaderId, "的心跳请求，其任期为 ", args.Term, " 自己的任期为 ", rf.Term)
+	logger.Trace(rf.me, " 收到 id ", args.LeaderId, "的心跳请求，其任期为 ", args.Term, " 自己的任期为 ", rf.Term)
 	rf.mu.Lock()
 	if args.Term < int(rf.Term) {
 		// 自己的任期号比发来的心跳的大
@@ -388,7 +399,7 @@ func (rf *Raft) startVote() {
 		}
 		rf.mu.Unlock()
 
-		log.Debug("id ", rf.me, " 开始选举 ", rf.CurrentState)
+		logger.Debug("id ", rf.me, " 开始选举 ", rf.CurrentState)
 		// 自增任期号
 		rf.mu.Lock()
 		rf.Term++
@@ -404,21 +415,21 @@ func (rf *Raft) startVote() {
 		// todo: 添加剩余的参数
 		replies := make([]RequestVoteReply, len(rf.peers))
 
-		log.Trace("raft 对象信息", rf)
-		log.Trace("发送的选举消息:", args)
+		logger.Trace("raft 对象信息", rf)
+		logger.Trace("发送的选举消息:", args)
 
 		// 在这里发起一次选举，向所有的 server 发送选举请求
 		for idx, server := range rf.peers {
 			if idx != rf.me {
-				log.Trace(rf.me, " 遍历到 ", idx, " 了！！！")
+				logger.Trace(rf.me, " 遍历到 ", idx, " 了！！！")
 				replies[idx] = RequestVoteReply{}
-				log.Trace(rf.me, " 向 ", idx, " 发送了选举请求")
+				logger.Trace(rf.me, " 向 ", idx, " 发送了选举请求")
 				ok := server.Call("Raft.RequestVote", &args, &(replies[idx]))
 				if !ok {
-					log.Error(rf.me, "给 ", idx, " 发的选举没有得到回复")
+					logger.Warn(rf.me, "给 ", idx, " 发的选举没有得到回复")
 					continue
 				}
-				log.Trace("收到的选举回复, Term:", replies[idx].Term, ", Agree? ", replies[idx].VoteGranted)
+				logger.Trace("收到的选举回复, Term:", replies[idx].Term, ", Agree? ", replies[idx].VoteGranted)
 			}
 		}
 
@@ -433,12 +444,12 @@ func (rf *Raft) startVote() {
 					// 这里可以直接变成 follower，因为就算所有的服务器都是 follower，他们也会因为心跳超时而重新发起一轮选举
 					rf.CurrentState = FOLLOWER
 					rf.mu.Unlock()
-					log.Info("id ", rf.me, "选举失败, 收到的任期号为 ", v.Term, ", 自己的任期号为", rf.Term)
+					logger.Info("id ", rf.me, "选举失败, 收到的任期号为 ", v.Term, ", 自己的任期号为", rf.Term)
 					return
 				}
 			}
 		}
-		log.Debug("id ", rf.me, "获得选票", cnt, "张，总共有", len(rf.peers), "人")
+		logger.Debug("id ", rf.me, "获得选票", cnt, "张，总共有", len(rf.peers), "人")
 		rf.mu.Lock()
 		if cnt > len(rf.peers)/2 {
 			rf.CurrentState = LEADER
@@ -489,7 +500,7 @@ func (rf *Raft) SendHearBeatsClock(ctx context.Context) {
 		if rf.CurrentState != LEADER {
 			continue
 		}
-		log.Debug("id ", rf.me, " 发送心跳")
+		logger.Debug("id ", rf.me, " 发送心跳")
 		select {
 		default:
 			args := AppendEntriesArgs{}
@@ -504,7 +515,7 @@ func (rf *Raft) SendHearBeatsClock(ctx context.Context) {
 					ok := server.Call("Raft.AppendEntries", &args, &(replies[idx]))
 					if !ok {
 						noReplyNumber++
-						log.Error(rf.me, "给 ", idx, " 发的心跳没有得到回复")
+						logger.Warn(rf.me, "给 ", idx, " 发的心跳没有得到回复")
 						continue
 					}
 					if replies[idx].Term > int(rf.Term) {
@@ -517,7 +528,7 @@ func (rf *Raft) SendHearBeatsClock(ctx context.Context) {
 				}
 			}
 			// if noReplyNumber > len(rf.peers)/2 {
-			// 	log.Error(rf.me, "发送的心跳有", noReplyNumber, "人都没有回复")
+			// 	logger.Error(rf.me, "发送的心跳有", noReplyNumber, "人都没有回复")
 			// 	rf.mu.Lock()
 			// 	rf.CurrentState = FOLLOWER
 			// 	rf.mu.Unlock()

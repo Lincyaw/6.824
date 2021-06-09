@@ -15,6 +15,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 )
 
 // The tester generously allows solutions to complete elections in one second
@@ -63,40 +65,44 @@ func TestReElection2A(t *testing.T) {
 	cfg.begin("Test (2A): election after network failure")
 
 	leader1 := cfg.checkOneLeader()
-	fmt.Println("Old leader is ", leader1)
+	log.Error("Old leader is ", leader1)
 
 	// if the leader disconnects, a new one should be elected.
 	cfg.disconnect(leader1)
-	fmt.Println("server", leader1, "disconnected")
+	log.Error("server ", leader1, " disconnected")
 
 	leader3 := cfg.checkOneLeader()
-	fmt.Println("A new leader is ", leader3)
+	log.Error("A new leader is ", leader3)
 
 	// if the old leader rejoins, that shouldn't
 	// disturb the new leader.
 	cfg.connect(leader1)
-	fmt.Println("server", leader1, "connected")
+	log.Error("server ", leader1, " connected")
 
 	leader2 := cfg.checkOneLeader()
-	fmt.Println("now the leader is ", leader2)
+	log.Error("now the leader is ", leader2)
 	// if there's no quorum, no leader should
 	// be elected.
 	cfg.disconnect(leader2)
-	fmt.Println("server", leader2, "disconnected")
+	log.Error("server ", leader2, " disconnected")
 	cfg.disconnect((leader2 + 1) % servers)
-	fmt.Println("server", (leader2+1)%servers, "disconnected")
+	log.Error("server ", (leader2+1)%servers, " disconnected")
 
 	time.Sleep(2 * RaftElectionTimeout)
 	cfg.checkNoLeader()
-	fmt.Println("There should not be leader.")
+	log.Error("There should not be leader.")
 
 	// if a quorum arises, it should elect a leader.
+	log.Error((leader2+1)%servers, " connected")
 	cfg.connect((leader2 + 1) % servers)
-	cfg.checkOneLeader()
+	leader4 := cfg.checkOneLeader()
+	log.Error("now the leader is ", leader4)
 
 	// re-join of last node shouldn't prevent leader from existing.
+	log.Error(leader2, " connected")
 	cfg.connect(leader2)
-	cfg.checkOneLeader()
+	leader5 := cfg.checkOneLeader()
+	log.Error("now the leader is ", leader5)
 
 	cfg.end()
 }
