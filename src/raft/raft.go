@@ -291,6 +291,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// 自己的任期号比发来的心跳的大
 		reply.Term = int(rf.Term)
 	} else {
+		reply.Term = args.Term
 		atomic.StoreInt32(&rf.Term, int32(args.Term))
 		atomic.StoreInt32(&rf.receiveHeartBeat, 1)
 		atomic.StoreInt32(&rf.CurrentState, FOLLOWER)
