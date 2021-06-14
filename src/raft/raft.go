@@ -149,7 +149,9 @@ func init() {
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 	// Your code here (2A).
-	return int(rf.Term), rf.CurrentState == LEADER
+	state := atomic.LoadInt32(&rf.CurrentState)
+	term := atomic.LoadInt32(&rf.Term)
+	return int(term), state == LEADER
 }
 
 //
@@ -223,18 +225,26 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	term := atomic.LoadInt32(&rf.Term)
+	lastLogIndex := len(rf.Logs)
+	lastLogTerm := rf.Logs[len(rf.Logs)-1].Term
 
-	rf.mu.Lock()
-	if args.Term >= int(rf.Term) && args.LastLogIndex >= len(rf.Logs) {
+	if int(term) > args.Term {
+		reply.VoteGranted = false
+		reply.Term = int(term)
+		return
+	}
+
+	if args.LastLogIndex >= lastLogIndex && args.LastLogTerm >= lastLogTerm {
 		reply.VoteGranted = true
 		reply.Term = args.Term
 		logger.Trace(rf.me, " 收到了 ", args.CandidateId, " 的选举请求, 并且同意了")
-	} else {
-		reply.VoteGranted = false
-		reply.Term = int(rf.Term)
-		logger.Trace(rf.me, " 收到了 ", args.CandidateId, " 的选举请求, 但不同意")
+		return
 	}
-	rf.mu.Unlock()
+
+	reply.VoteGranted = false
+	logger.Trace(rf.me, " 收到了 ", args.CandidateId, " 的选举请求, 并且不同意")
+
 }
 
 //
@@ -286,8 +296,9 @@ type AppendEntriesReply struct {
 
 // 心跳通知、日志追加 RPC
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	logger.Trace(rf.me, " 收到 id ", args.LeaderId, "的心跳请求，其任期为 ", args.Term, " 自己的任期为 ", rf.Term)
-	if args.Term < int(rf.Term) {
+	term := atomic.LoadInt32(&rf.Term)
+	logger.Trace(rf.me, " 收到 id ", args.LeaderId, "的心跳请求，其任期为 ", args.Term, " 自己的任期为 ", term)
+	if args.Term < int(term) {
 		// 自己的任期号比发来的心跳的大
 		reply.Term = int(rf.Term)
 	} else {
@@ -336,6 +347,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 //
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
+	atomic.StoreInt32(&rf.CurrentState, FOLLOWER)
 	// Your code here, if desired.
 }
 
@@ -374,11 +386,11 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	// 启动心跳计时器，超时则发起选举，自己变成候选人状态
 	ctx := context.Background()
 	// follower 需要定时接收心跳，没收到心跳就变成 candicator
-	go rf.CheckHeartBeatsClock(ctx, rand.Intn(100)+200)
+	go rf.CheckHeartBeatsClock(ctx, 212)
 	// leader 需要定时发送心跳
-	go rf.SendHearBeatsClock(ctx)
+	go rf.SendHearBeatsClock(ctx, 105)
 	// candicator 身份需要发起一轮选举
-	go rf.startVote()
+	go rf.startVote(rand.Intn(100) + 120)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -386,14 +398,15 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	return rf
 }
 
-func (rf *Raft) startVote() {
+func (rf *Raft) startVote(timeout int) {
 	for {
 		state := atomic.LoadInt32(&rf.CurrentState)
 		if state != CANDICATER || rf.killed() {
 			continue
 		}
 
-		logger.Debug("id ", rf.me, " 开始选举 ", rf.CurrentState)
+		term := atomic.LoadInt32(&rf.Term)
+		logger.Debug("id ", rf.me, " 开始选举,自己的任期为 ", term)
 		// 自增任期号
 		atomic.AddInt32(&rf.Term, 1)
 		// 自己给自己投票
@@ -428,7 +441,8 @@ func (rf *Raft) startVote() {
 				if v.VoteGranted {
 					cnt++
 				}
-				if v.Term > int(rf.Term) {
+				term := atomic.LoadInt32(&rf.Term)
+				if v.Term > int(term) {
 					atomic.StoreInt32(&rf.Term, int32(v.Term))
 					// 这里可以直接变成 follower，因为就算所有的服务器都是 follower，他们也会因为心跳超时而重新发起一轮选举
 					atomic.StoreInt32(&rf.CurrentState, FOLLOWER)
@@ -443,7 +457,7 @@ func (rf *Raft) startVote() {
 		} else {
 			// 没有当选成功，并且自己也没有变成 follower，则继续选举，并且设置一定的超时时间，防止多数服务器同时又开始一轮选举
 			atomic.StoreInt32(&rf.CurrentState, CANDICATER)
-			time.Sleep((time.Duration(180) * time.Millisecond))
+			time.Sleep((time.Duration(timeout) * time.Millisecond))
 		}
 	}
 }
@@ -461,18 +475,14 @@ func (rf *Raft) CheckHeartBeatsClock(ctx context.Context, timeout int) {
 		default:
 			// 初始化标志位
 			atomic.StoreInt32(&rf.receiveHeartBeat, 0)
+
 			time.Sleep(time.Duration(timeout) * time.Millisecond)
 
 			rec := atomic.LoadInt32(&rf.receiveHeartBeat)
-			state = atomic.LoadInt32(&rf.CurrentState)
+			state := atomic.LoadInt32(&rf.CurrentState)
 			// 没收到心跳
-			if rec == 0 {
-				if state != LEADER {
-					atomic.StoreInt32(&rf.CurrentState, CANDICATER)
-				}
-			} else {
-				// 收到了
-				atomic.StoreInt32(&rf.CurrentState, FOLLOWER)
+			if rec == 0 && state == FOLLOWER {
+				atomic.StoreInt32(&rf.CurrentState, CANDICATER)
 			}
 		case <-ctx.Done():
 			return
@@ -481,8 +491,8 @@ func (rf *Raft) CheckHeartBeatsClock(ctx context.Context, timeout int) {
 }
 
 // 发送心跳计时器  master -> follower
-// 每 150ms 向所有的服务器发送心跳，如果返回的心跳 Term 比自己大，则把自己的状态转变为 Follower，然后退出向所有服务器发送心跳的循环
-func (rf *Raft) SendHearBeatsClock(ctx context.Context) {
+// 每 timeout ms 向所有的服务器发送心跳，如果返回的心跳 Term 比自己大，则把自己的状态转变为 Follower，然后退出向所有服务器发送心跳的循环
+func (rf *Raft) SendHearBeatsClock(ctx context.Context, timeout int) {
 	for {
 		state := atomic.LoadInt32(&rf.CurrentState)
 		if state != LEADER || rf.killed() {
@@ -491,8 +501,9 @@ func (rf *Raft) SendHearBeatsClock(ctx context.Context) {
 		logger.Debug("id ", rf.me, " 发送心跳")
 		select {
 		default:
+			term := atomic.LoadInt32(&rf.Term)
 			args := AppendEntriesArgs{
-				Term:     int(rf.Term),
+				Term:     int(term),
 				LeaderId: rf.me,
 			}
 			// 可能少了点参数
@@ -507,7 +518,8 @@ func (rf *Raft) SendHearBeatsClock(ctx context.Context) {
 						logger.Warn(rf.me, "给 ", idx, " 发的心跳没有得到回复")
 						continue
 					}
-					if replies[idx].Term > int(rf.Term) {
+					term := atomic.LoadInt32(&rf.Term)
+					if replies[idx].Term > int(term) {
 						// 收到的 Term 比自己的大
 						atomic.StoreInt32(&rf.Term, int32(replies[idx].Term))
 						atomic.StoreInt32(&rf.CurrentState, FOLLOWER)
@@ -520,10 +532,10 @@ func (rf *Raft) SendHearBeatsClock(ctx context.Context) {
 				atomic.StoreInt32(&rf.CurrentState, FOLLOWER)
 				goto CON
 			}
-			time.Sleep(time.Duration(110) * time.Millisecond)
 		case <-ctx.Done():
 			return
 		}
 	CON:
+		time.Sleep(time.Duration(timeout) * time.Millisecond)
 	}
 }
