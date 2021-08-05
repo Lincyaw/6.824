@@ -11,3 +11,10 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	}
 	return
 }
+
+func Int32Min(a,b int32) int32 {
+	if a>b {
+		return b
+	}
+	return a
+}

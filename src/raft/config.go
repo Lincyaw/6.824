@@ -9,7 +9,6 @@ package raft
 //
 
 import "../labrpc"
-import "log"
 import "sync"
 import "testing"
 import "runtime"
@@ -19,7 +18,7 @@ import "math/big"
 import "encoding/base64"
 import "time"
 import "fmt"
-
+import log "github.com/sirupsen/logrus"
 func randstring(n int) string {
 	b := make([]byte, 2*n)
 	crand.Read(b)

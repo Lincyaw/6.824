@@ -18,7 +18,10 @@ package raft
 //
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
 	"math/rand"
 	"os"
 	"sync"
@@ -90,12 +93,12 @@ type Raft struct {
 	Logs        []Log
 
 	// Volatile state
-	CommitIndex int
-	LastApplied int
+	CommitIndex int32 // 已知被提交的最高日志条目的索引（初始化为0，单调地增加）。
+	LastApplied int32 // 应用于状态机的最高日志条目的索引（初始化为 0，单调地增加).
 
 	// Volatile state on leaders
-	NextIndex  []int
-	MatchIndex []int
+	NextIndex  []int32
+	MatchIndex []int32
 
 	// 我自己添加的状态
 	CurrentState           int32 // 当前的状态
@@ -107,18 +110,19 @@ type Raft struct {
 	HeartBeatCheck         int
 }
 
-//func (rf *Raft) String() string {
-//	b, err := json.Marshal(*rf)
-//	if err != nil {
-//		return fmt.Sprintf("%+v", *rf)
-//	}
-//	var out bytes.Buffer
-//	err = json.Indent(&out, b, "", "    ")
-//	if err != nil {
-//		return fmt.Sprintf("%+v", *rf)
-//	}
-//	return out.String()
-//}
+func (rf *Raft) String() string {
+	b, err := json.Marshal(*rf)
+	if err != nil {
+		return fmt.Sprintf("%+v", *rf)
+	}
+	var out bytes.Buffer
+	err = json.Indent(&out, b, "", "    ")
+	if err != nil {
+		return fmt.Sprintf("%+v", *rf)
+	}
+	return out.String()
+}
+
 //
 //func (r *RequestVoteArgs) String() string {
 //	b, err := json.Marshal(*r)
@@ -148,7 +152,7 @@ type Raft struct {
 
 type Log struct {
 	Term    int
-	Command string
+	Command interface{}
 }
 
 // GetState return currentTerm and whether this server
@@ -300,34 +304,74 @@ type AppendEntriesArgs struct {
 	// leader's term
 	Term         int
 	LeaderId     int
-	PrevLogIndex int
-	PrevLogTerm  int
-	Entries      []int
-	LeaderCommit int
+	PrevLogIndex int // index of log entry immediately preceding new ones, 指最后一条日志的 index
+	PrevLogTerm  int // term of prevLogIndex entry, 最后一条日志的 term
+	Entries      []Log
+	LeaderCommit int // leader's commitIndex
 }
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+	// 以下是论文 5.3 节, 第 7 页, 提到的一个优化方案来减少 rpc
+	LastCommitIndex int
 }
 
 // AppendEntries 心跳通知、日志追加 RPC
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	term := atomic.LoadInt32(&rf.CurrentTerm)
 	logger.Trace(rf.me, " 收到 id ", args.LeaderId, "的心跳请求，其任期为 ", args.Term, " 自己的任期为 ", term)
+
+	// 自己的任期号比发来的心跳的大
 	if args.Term < int(term) {
-		// 自己的任期号比发来的心跳的大
 		reply.Term = int(rf.CurrentTerm)
 		reply.Success = false
 		return
 	}
-
-	reply.Term = args.Term
-	reply.Success = true
+	// 下面三行, 不管
 	atomic.StoreInt32(&rf.CurrentTerm, int32(args.Term))
 	atomic.StoreInt32(&rf.CurrentState, FOLLOWER)
-	// 收到心跳后，应该抑制其变为 candicater, 并且抑制其发起选举
-	rf.HeartBeatTimeOutTicker.Reset(time.Duration(rf.HeartBeatCheck) * time.Millisecond)
-	rf.VoteTimeOutTicker.Reset(time.Duration(rf.VoteTime) * time.Millisecond)
+	reply.Term = args.Term
+
+	// 心跳：自己的任期号比发来的心跳的小
+	if len(args.Entries) == 0 {
+		reply.Success = true
+		// 收到心跳后，应该抑制其变为 candidate, 并且抑制其发起选举
+		rf.HeartBeatTimeOutTicker.Reset(time.Duration(rf.HeartBeatCheck) * time.Millisecond)
+		rf.VoteTimeOutTicker.Reset(time.Duration(rf.VoteTime) * time.Millisecond)
+		return
+	}
+
+	// 接受日志，先检查已有的部分是否与 leader 一致
+	if args.PrevLogIndex >= 0 && (len(rf.Logs)-1 < args.PrevLogIndex || rf.Logs[args.PrevLogIndex].Term != args.PrevLogTerm) {
+		reply.LastCommitIndex = len(rf.Logs) - 1
+		// 本地日志长度比远端的长,则舍弃多出来的
+		if reply.LastCommitIndex > args.PrevLogIndex {
+			reply.LastCommitIndex = args.PrevLogIndex
+		}
+		// 一直往前找,直到找到匹配的项
+		for reply.LastCommitIndex >= 0 {
+			if rf.Logs[reply.LastCommitIndex].Term != args.Term {
+				reply.LastCommitIndex--
+			} else {
+				break
+			}
+		}
+		// 删除匹配不上的日志
+		rf.Logs = rf.Logs[:reply.LastCommitIndex]
+		rf.CommitIndex = int32(reply.LastCommitIndex)
+		// 此时, 返回值 reply 中, 包含了最后一条与 leader 匹配上的日志的 index, 记作 LastCommitIndex
+		// 要求 leader 需要重发这个 LastCommitIndex 之后的所有的 log
+		reply.Success = false
+		return
+	}
+
+	// rf.Logs = rf.Logs[:args.PrevLogIndex+1] // 这行应该不需要，因为上面的代码一定是把不一致的日志拦截了
+	rf.Logs = append(rf.Logs, args.Entries...)
+	if int32(args.LeaderCommit) > rf.CommitIndex {
+		rf.CommitIndex = Int32Min(int32(args.LeaderCommit), int32(len(rf.Logs)-1))
+	}
+	reply.Success = true
+	reply.LastCommitIndex = int(rf.CommitIndex)
 }
 
 //
@@ -339,19 +383,32 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 // may fail or lose an election. even if the Raft instance has been killed,
 // this function should return gracefully.
 //
-// the first return value is the index that the command will appear at
-// if it's ever committed. the second return value is the current
-// term. the third return value is true if this server believes it is
+// the first return value is the index that the command will appear at if it's ever committed.
+// the second return value is the current term.
+// the third return value is true if this server believes it is
 // the leader.
 //
 // 让 raft 把 command 添加到 log 中
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	// Your code here (2B).
 	index := -1
 	term := -1
-	isLeader := true
-
-	// Your code here (2B).
-
+	isLeader := false
+	state := atomic.LoadInt32(&rf.CurrentState)
+	if state != LEADER {
+		return index, term, false
+	}
+	term = int(atomic.LoadInt32(&rf.CurrentTerm))
+	isLeader = state == LEADER
+	newLog := Log{
+		Term:    term,
+		Command: command,
+	}
+	rf.Logs = append(rf.Logs, newLog)
+	for i := 0; i < len(rf.Logs); i++ {
+		rf.NextIndex[i] = int32(len(rf.Logs) - 1)
+	}
+	index = len(rf.Logs) - 1
 	return index, term, isLeader
 }
 
@@ -399,7 +456,10 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.CurrentTerm = 0
 	rf.CurrentState = FOLLOWER
+	rf.CommitIndex = -1
 	rf.VoteFor = -1
+	rf.NextIndex = make([]int32, len(peers))
+	rf.MatchIndex = make([]int32, len(peers))
 
 	rf.HeartBeatCheck = 220
 	rf.HeartBeatSend = 105
@@ -417,9 +477,9 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	// 启动心跳计时器，超时则发起选举，自己变成候选人状态
 	ctx := context.Background()
 	// follower 需要定时接收心跳，没收到心跳就变成 candicator
-	go rf.CheckHeartBeatsClock(ctx)
+	go rf.checkHeartBeatsClock(ctx)
 	// leader 需要定时发送心跳
-	go rf.SendHearBeatsClock(ctx)
+	go rf.sendHearBeatsClock(ctx)
 	// candidate 身份需要发起一轮选举
 	go rf.startVote(ctx)
 
@@ -428,6 +488,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 
 	return rf
 }
+
 // startVote
 // 发起一轮投票，实现方式为一个死循环，如果自己的状态为 candidate，并且计时器超时了，则发起投票
 func (rf *Raft) startVote(ctx context.Context) {
@@ -447,7 +508,7 @@ func (rf *Raft) startVote(ctx context.Context) {
 
 			// 自己给自己投票
 			cnt := 1
-			rf.VoteFor = rf.me
+			//rf.VoteFor = rf.me
 			args := RequestVoteArgs{
 				CandidateId:  rf.me,
 				Term:         int(term),
@@ -462,7 +523,9 @@ func (rf *Raft) startVote(ctx context.Context) {
 					server := server
 					go func() {
 						logger.Trace(rf.me, " 向 ", idx, " 发送了选举请求")
+						//rf.mu.Lock()
 						ok := server.Call("Raft.RequestVote", &args, &(replies[idx]))
+						//rf.mu.Unlock()
 						if !ok {
 							logger.Warn(rf.me, "给 ", idx, " 发的选举没有得到回复")
 						} else {
@@ -472,7 +535,8 @@ func (rf *Raft) startVote(ctx context.Context) {
 				}
 			}
 			time.Sleep(100 * time.Millisecond)
-
+			// todo: 此处存在一个 race 隐患, 不加锁的话, 会导致并发读写 replies；加锁的话又会导致无法及时统计自己是否当选
+			//rf.mu.Lock()
 			for idx, v := range replies {
 				if idx != rf.me {
 					if v.VoteGranted {
@@ -487,6 +551,7 @@ func (rf *Raft) startVote(ctx context.Context) {
 					}
 				}
 			}
+			//rf.mu.Unlock()
 
 			logger.Debug("id ", rf.me, "获得选票", cnt, "张，总共有", len(rf.peers), "人")
 			// 获胜则变成 leader，没获胜则依旧是 candidate，继续选举
@@ -502,10 +567,10 @@ func (rf *Raft) startVote(ctx context.Context) {
 
 }
 
-// CheckHeartBeatsClock
+// checkHeartBeatsClock
 // 检查心跳计时器，如果一切正常的话，每次收到的心跳都会抑制这个计时器
 // 如果没有收到心跳，则转变自己的状态为 candidate
-func (rf *Raft) CheckHeartBeatsClock(ctx context.Context) {
+func (rf *Raft) checkHeartBeatsClock(ctx context.Context) {
 	for {
 		select {
 		case <-rf.HeartBeatTimeOutTicker.C:
@@ -522,10 +587,10 @@ func (rf *Raft) CheckHeartBeatsClock(ctx context.Context) {
 	}
 }
 
-// SendHearBeatsClock
+// sendHearBeatsClock
 // 定时发送心跳  master -> follower
 // 如果返回的心跳 CurrentTerm 比自己大，则把自己的状态转变为 Follower，然后退出向所有服务器发送心跳的循环
-func (rf *Raft) SendHearBeatsClock(ctx context.Context) {
+func (rf *Raft) sendHearBeatsClock(ctx context.Context) {
 	for {
 		select {
 		case <-rf.HeartBeatTicker.C:
@@ -545,19 +610,32 @@ func (rf *Raft) SendHearBeatsClock(ctx context.Context) {
 			for idx, server := range rf.peers {
 				idx := idx
 				server := server
+				args := args
 				if idx != rf.me {
+					// 向 follower 发送其没有的日志
+					if int(rf.NextIndex[idx]) < len(rf.Logs)-1 || int(rf.MatchIndex[idx]) < len(rf.Logs)-1 {
+						args.Entries = rf.Logs[Int32Min(rf.NextIndex[idx], rf.MatchIndex[idx]):]
+					}
 					go func() {
-						ok := server.Call("Raft.AppendEntries", &args, &(replies[idx]))
-						if !ok {
+					start:
+						for !server.Call("Raft.AppendEntries", &args, &(replies[idx])) {
 							atomic.AddInt32(&noReplyNumber, 1)
 							logger.Warn(rf.me, "给 ", idx, " 发的心跳没有得到回复")
-							return
+							if args.Entries == nil {
+								break
+							}
 						}
 						if replies[idx].Term > int(term) {
 							// 收到的 CurrentTerm 比自己的大
 							atomic.StoreInt32(&rf.CurrentTerm, int32(replies[idx].Term))
 							atomic.StoreInt32(&rf.CurrentState, FOLLOWER)
 							return
+						}
+						// false 只可能是 log 对不上
+						if replies[idx].Success == false {
+							rf.MatchIndex[idx] = int32(replies[idx].LastCommitIndex)
+							rf.NextIndex[idx] = int32(replies[idx].LastCommitIndex)
+							goto start
 						}
 					}()
 				}
@@ -573,4 +651,14 @@ func (rf *Raft) SendHearBeatsClock(ctx context.Context) {
 			return
 		}
 	}
+}
+
+func (rf *Raft) appendNewEntry(cmd interface{}) Log {
+	term := int(atomic.LoadInt32(&rf.CurrentTerm))
+	logs := Log{
+		Term:    term,
+		Command: cmd,
+	}
+	rf.Logs = append(rf.Logs, logs)
+	return logs
 }

@@ -10,13 +10,12 @@ package raft
 
 import (
 	"fmt"
+	log "github.com/sirupsen/logrus"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
-
-	log "github.com/sirupsen/logrus"
 )
 
 // The tester generously allows solutions to complete elections in one second
@@ -120,7 +119,6 @@ func TestBasicAgree2B(t *testing.T) {
 		if nd > 0 {
 			t.Fatalf("some have committed before Start()")
 		}
-
 		xindex := cfg.one(index*100, servers, false)
 		if xindex != index {
 			t.Fatalf("got index %v but expected %v", xindex, index)
