@@ -101,6 +101,7 @@ type Raft struct {
 	MatchIndex []int32
 
 	// 我自己添加的状态
+	cancel                 context.CancelFunc
 	CurrentState           int32 // 当前的状态
 	HeartBeatTicker        *time.Ticker
 	HeartBeatTimeOutTicker *time.Ticker
@@ -346,13 +347,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 接受日志，先检查已有的部分是否与 leader 一致
 	if args.PrevLogIndex >= 0 && (len(rf.Logs)-1 < args.PrevLogIndex || rf.Logs[args.PrevLogIndex].Term != args.PrevLogTerm) {
 		logger.Error(rf.me, "日志不匹配")
-		if args.PrevLogIndex >=0 && len(rf.Logs) > args.PrevLogIndex {
-			logger.Error(rf.Logs[args.PrevLogIndex].Term,"  ", args.PrevLogTerm)
+		if args.PrevLogIndex >= 0 && len(rf.Logs) > args.PrevLogIndex {
+			logger.Error(rf.Logs[args.PrevLogIndex].Term, "  ", args.PrevLogTerm)
 		}
-		reply.LastCommitIndex = IntMax(len(rf.Logs) - 1,0)
+		reply.LastCommitIndex = IntMax(len(rf.Logs)-1, 0)
 		// 本地日志长度比远端的长,则舍弃多出来的
 		if reply.LastCommitIndex > args.PrevLogIndex {
-			reply.LastCommitIndex = IntMax(args.PrevLogIndex,0)
+			reply.LastCommitIndex = IntMax(args.PrevLogIndex, 0)
 		}
 		// 一直往前找,直到找到匹配的项
 		for reply.LastCommitIndex > 0 {
@@ -435,6 +436,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	atomic.StoreInt32(&rf.CurrentState, FOLLOWER)
+	rf.cancel()
 	// Your code here, if desired.
 }
 
@@ -486,7 +488,8 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	//})
 
 	// 启动心跳计时器，超时则发起选举，自己变成候选人状态
-	ctx := context.Background()
+	var ctx context.Context
+	ctx, rf.cancel = context.WithCancel(context.Background())
 	// follower 需要定时接收心跳，没收到心跳就变成 candicator
 	go rf.checkHeartBeatsClock(ctx)
 	// leader 需要定时发送心跳
