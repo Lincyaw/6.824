@@ -7,7 +7,7 @@
 3. func (rf *Raft) Start(command interface{}) (int, int, bool) 
 4. Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan ApplyMsg)
 
-![raft](images/raft.png
+![raft](images/raft.png)
 
 
 ## start
