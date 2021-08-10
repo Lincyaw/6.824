@@ -18,3 +18,10 @@ func Int32Min(a,b int32) int32 {
 	}
 	return a
 }
+
+func IntMax(a,b int) int {
+	if a<b {
+		return b
+	}
+	return a
+}

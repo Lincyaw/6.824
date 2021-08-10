@@ -49,7 +49,7 @@ func init() {
 // import "bytes"
 // import "../labgob"
 
-//
+// ApplyMsg
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
 // tester) on the same server, via the applyCh passed to Make(). set
@@ -72,7 +72,7 @@ const (
 	LEADER    int32 = 3
 )
 
-//
+// Raft
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
@@ -111,14 +111,14 @@ type Raft struct {
 }
 
 func (rf *Raft) String() string {
-	b, err := json.Marshal(*rf)
+	b, err := json.Marshal(rf)
 	if err != nil {
-		return fmt.Sprintf("%+v", *rf)
+		return fmt.Sprintf("%+v", rf)
 	}
 	var out bytes.Buffer
 	err = json.Indent(&out, b, "", "    ")
 	if err != nil {
-		return fmt.Sprintf("%+v", *rf)
+		return fmt.Sprintf("%+v", rf)
 	}
 	return out.String()
 }
@@ -238,8 +238,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	defer rf.voteLock.Unlock()
 	term := atomic.LoadInt32(&rf.CurrentTerm)
 	lastLogIndex := len(rf.Logs)
-	lastLogTerm := rf.Logs[len(rf.Logs)-1].Term
-
+	lastLogTerm := 0
+	if len(rf.Logs) != 0 {
+		lastLogTerm = rf.Logs[len(rf.Logs)-1].Term
+	}
 	if int(term) > args.Term {
 		reply.VoteGranted = false
 		reply.Term = int(term)
@@ -340,16 +342,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.VoteTimeOutTicker.Reset(time.Duration(rf.VoteTime) * time.Millisecond)
 		return
 	}
-
+	logger.Error(rf.me, " 收到日志：", args.Entries)
 	// 接受日志，先检查已有的部分是否与 leader 一致
 	if args.PrevLogIndex >= 0 && (len(rf.Logs)-1 < args.PrevLogIndex || rf.Logs[args.PrevLogIndex].Term != args.PrevLogTerm) {
-		reply.LastCommitIndex = len(rf.Logs) - 1
+		logger.Error(rf.me, "日志不匹配")
+		if args.PrevLogIndex >=0 && len(rf.Logs) > args.PrevLogIndex {
+			logger.Error(rf.Logs[args.PrevLogIndex].Term,"  ", args.PrevLogTerm)
+		}
+		reply.LastCommitIndex = IntMax(len(rf.Logs) - 1,0)
 		// 本地日志长度比远端的长,则舍弃多出来的
 		if reply.LastCommitIndex > args.PrevLogIndex {
-			reply.LastCommitIndex = args.PrevLogIndex
+			reply.LastCommitIndex = IntMax(args.PrevLogIndex,0)
 		}
 		// 一直往前找,直到找到匹配的项
-		for reply.LastCommitIndex >= 0 {
+		for reply.LastCommitIndex > 0 {
 			if rf.Logs[reply.LastCommitIndex].Term != args.Term {
 				reply.LastCommitIndex--
 			} else {
@@ -365,16 +371,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	// rf.Logs = rf.Logs[:args.PrevLogIndex+1] // 这行应该不需要，因为上面的代码一定是把不一致的日志拦截了
 	rf.Logs = append(rf.Logs, args.Entries...)
-	if int32(args.LeaderCommit) > rf.CommitIndex {
-		rf.CommitIndex = Int32Min(int32(args.LeaderCommit), int32(len(rf.Logs)-1))
-	}
+	rf.Logs = rf.Logs[:args.PrevLogIndex+1] // 这行应该不需要，因为上面的代码一定是把不一致的日志拦截了
+	logger.Error(rf.me, "接受日志，本地日志为:", rf.Logs)
+	rf.CommitIndex = int32(len(rf.Logs) - 1)
+	//if int32(args.LeaderCommit) > rf.CommitIndex {
+	//	rf.CommitIndex = Int32Min(int32(args.LeaderCommit), rf.CommitIndex)
+	//}
 	reply.Success = true
 	reply.LastCommitIndex = int(rf.CommitIndex)
 }
 
-//
+// Start
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
@@ -405,6 +413,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Command: command,
 	}
 	rf.Logs = append(rf.Logs, newLog)
+	logger.Error("收到 command, 本地 log: ", rf.Logs)
 	for i := 0; i < len(rf.Logs); i++ {
 		rf.NextIndex[i] = int32(len(rf.Logs) - 1)
 	}
@@ -412,7 +421,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	return index, term, isLeader
 }
 
-//
+// Kill
 // the tester doesn't halt goroutines created by Raft after each test,
 // but it does call the Kill() method. your code can use killed() to
 // check whether Kill() has been called. the use of atomic avoids the
@@ -434,7 +443,7 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-//
+// Make
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
@@ -469,10 +478,12 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.HeartBeatTimeOutTicker = time.NewTicker(time.Duration(rf.HeartBeatCheck))
 	rf.HeartBeatTicker = time.NewTicker(time.Duration(rf.HeartBeatSend))
 
-	rf.Logs = append(rf.Logs, Log{
-		Term:    0,
-		Command: "Init",
-	})
+	rf.Logs = make([]Log, 0)
+
+	//		append(rf.Logs, Log{
+	//	Term:    0,
+	//	Command: "Init",
+	//})
 
 	// 启动心跳计时器，超时则发起选举，自己变成候选人状态
 	ctx := context.Background()
@@ -509,11 +520,14 @@ func (rf *Raft) startVote(ctx context.Context) {
 			// 自己给自己投票
 			cnt := 1
 			//rf.VoteFor = rf.me
+
 			args := RequestVoteArgs{
 				CandidateId:  rf.me,
 				Term:         int(term),
 				LastLogIndex: len(rf.Logs),
-				LastLogTerm:  rf.Logs[len(rf.Logs)-1].Term,
+			}
+			if len(rf.Logs) != 0 {
+				args.LastLogTerm = rf.Logs[len(rf.Logs)-1].Term
 			}
 			// 在这里发起一次选举，向所有的 server 发送选举请求
 			replies := make([]RequestVoteReply, len(rf.peers))
@@ -557,6 +571,10 @@ func (rf *Raft) startVote(ctx context.Context) {
 			// 获胜则变成 leader，没获胜则依旧是 candidate，继续选举
 			if cnt > len(rf.peers)/2 {
 				atomic.StoreInt32(&rf.CurrentState, LEADER)
+				for i := 0; i < len(rf.NextIndex); i++ {
+					rf.NextIndex[i] = 0
+					rf.MatchIndex[i] = 0
+				}
 			}
 		CON:
 			continue
@@ -601,8 +619,12 @@ func (rf *Raft) sendHearBeatsClock(ctx context.Context) {
 			logger.Debug("id ", rf.me, " 发送心跳")
 			term := atomic.LoadInt32(&rf.CurrentTerm)
 			args := AppendEntriesArgs{
-				Term:     int(term),
-				LeaderId: rf.me,
+				Term:         int(term),
+				LeaderId:     rf.me,
+				PrevLogIndex: len(rf.Logs) - 1,
+			}
+			if len(rf.Logs) != 0 {
+				args.PrevLogTerm = rf.Logs[len(rf.Logs)-1].Term
 			}
 
 			replies := make([]AppendEntriesReply, len(rf.peers))
@@ -613,8 +635,9 @@ func (rf *Raft) sendHearBeatsClock(ctx context.Context) {
 				args := args
 				if idx != rf.me {
 					// 向 follower 发送其没有的日志
-					if int(rf.NextIndex[idx]) < len(rf.Logs)-1 || int(rf.MatchIndex[idx]) < len(rf.Logs)-1 {
+					if int(rf.NextIndex[idx]) <= len(rf.Logs)-1 || int(rf.MatchIndex[idx]) <= len(rf.Logs)-1 {
 						args.Entries = rf.Logs[Int32Min(rf.NextIndex[idx], rf.MatchIndex[idx]):]
+						logger.Error("nextIndex: ", rf.NextIndex[idx], ", matchIndex: ", rf.MatchIndex[idx], ", ", rf.me, "向", idx, "心跳附加日志：", args.Entries)
 					}
 					go func() {
 					start:
@@ -633,9 +656,15 @@ func (rf *Raft) sendHearBeatsClock(ctx context.Context) {
 						}
 						// false 只可能是 log 对不上
 						if replies[idx].Success == false {
+							logger.Error("log 对不上")
 							rf.MatchIndex[idx] = int32(replies[idx].LastCommitIndex)
 							rf.NextIndex[idx] = int32(replies[idx].LastCommitIndex)
 							goto start
+						}
+						if args.Entries != nil {
+							logger.Error("log 传输完毕")
+							rf.MatchIndex[idx] = int32(replies[idx].LastCommitIndex + 1)
+							rf.NextIndex[idx] = int32(replies[idx].LastCommitIndex + 1)
 						}
 					}()
 				}
