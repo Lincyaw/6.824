@@ -19,6 +19,7 @@ import "encoding/base64"
 import "time"
 import "fmt"
 import log "github.com/sirupsen/logrus"
+
 func randstring(n int) string {
 	b := make([]byte, 2*n)
 	crand.Read(b)
@@ -448,13 +449,14 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 				}
 			}
 		}
-
 		if index != -1 {
+			fmt.Println("a leader comes out")
 			// somebody claimed to be the leader and to have
 			// submitted our command; wait a while for agreement.
 			t1 := time.Now()
 			for time.Since(t1).Seconds() < 2 {
 				nd, cmd1 := cfg.nCommitted(index)
+				fmt.Println("position ", index, "has committed ", nd, "logs: ", cmd1, "正确的log是：", cmd, "希望有 ", expectedServers, " 个服务器 commit")
 				if nd > 0 && nd >= expectedServers {
 					// committed
 					if cmd1 == cmd {

@@ -89,7 +89,7 @@ type Raft struct {
 
 	// Persistent state
 	CurrentTerm int32 // 当前的任期
-	VoteFor     int   //candidateId that received vote in current term (or null if none)
+	VoteFor     int32 //candidateId that received vote in current term (or null if none)
 	Logs        []Log
 
 	// Volatile state
@@ -101,6 +101,7 @@ type Raft struct {
 	MatchIndex []int32
 
 	// 我自己添加的状态
+	ApplyM                 *chan ApplyMsg
 	cancel                 context.CancelFunc
 	CurrentState           int32 // 当前的状态
 	HeartBeatTicker        *time.Ticker
@@ -152,7 +153,7 @@ func (rf *Raft) String() string {
 //}
 
 type Log struct {
-	Term    int
+	Term    int32
 	Command interface{}
 }
 
@@ -210,13 +211,13 @@ func (rf *Raft) readPersist(data []byte) {
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
 	// 候选人的任期号
-	Term int
+	Term int32
 	// 请求选票的候选人 id
-	CandidateId int
+	CandidateId int32
 	// 候选人最后日志条目的索引值
-	LastLogIndex int
+	LastLogIndex int32
 	// 候选人最后日志条目的任期号
-	LastLogTerm int
+	LastLogTerm int32
 }
 
 // RequestVoteReply
@@ -226,7 +227,7 @@ type RequestVoteArgs struct {
 type RequestVoteReply struct {
 	// Your data here (2A).
 	// 当前任期号，以便候选人更新自己的任期号
-	Term int
+	Term int32
 	// 是否同意这次选票
 	VoteGranted bool
 }
@@ -238,14 +239,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.voteLock.Lock()
 	defer rf.voteLock.Unlock()
 	term := atomic.LoadInt32(&rf.CurrentTerm)
-	lastLogIndex := len(rf.Logs)
-	lastLogTerm := 0
+	var lastLogTerm, lastLogIndex int32 = 0, int32(len(rf.Logs))
 	if len(rf.Logs) != 0 {
 		lastLogTerm = rf.Logs[len(rf.Logs)-1].Term
 	}
-	if int(term) > args.Term {
+	if term > args.Term {
 		reply.VoteGranted = false
-		reply.Term = int(term)
+		reply.Term = term
 		return
 	}
 	// 收到的 rpc 里的 term 比自己的大，因此将状态转为跟随者
@@ -255,7 +255,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		if args.LastLogTerm > lastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex) {
 			reply.VoteGranted = true
 			reply.Term = args.Term
-			atomic.StoreInt32(&rf.CurrentTerm, int32(args.Term))
+			atomic.StoreInt32(&rf.CurrentTerm, args.Term)
 			logger.Trace(rf.me, " 收到了 ", args.CandidateId, " 的选举请求, 同意")
 
 			// 收到选举请求后，需要抑制自己进行选举，否则可能导致不断地发起选举
@@ -305,18 +305,18 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 type AppendEntriesArgs struct {
 	// leader's term
-	Term         int
-	LeaderId     int
-	PrevLogIndex int // index of log entry immediately preceding new ones, 指最后一条日志的 index
-	PrevLogTerm  int // term of prevLogIndex entry, 最后一条日志的 term
+	Term         int32
+	LeaderId     int32
+	PrevLogIndex int32 // index of log entry immediately preceding new ones, 指最后一条日志的 index
+	PrevLogTerm  int32 // term of prevLogIndex entry, 最后一条日志的 term
 	Entries      []Log
-	LeaderCommit int // leader's commitIndex
+	LeaderCommit int32 // leader's commitIndex
 }
 type AppendEntriesReply struct {
-	Term    int
+	Term    int32
 	Success bool
 	// 以下是论文 5.3 节, 第 7 页, 提到的一个优化方案来减少 rpc
-	LastCommitIndex int
+	LastCommitIndex int32
 }
 
 // AppendEntries 心跳通知、日志追加 RPC
@@ -325,13 +325,23 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	logger.Trace(rf.me, " 收到 id ", args.LeaderId, "的心跳请求，其任期为 ", args.Term, " 自己的任期为 ", term)
 
 	// 自己的任期号比发来的心跳的大 §5.1
-	if args.Term < int(term) {
-		reply.Term = int(rf.CurrentTerm)
+	if args.Term < term {
+		reply.Term = rf.CurrentTerm
 		reply.Success = false
 		return
 	}
+	if args.LeaderCommit > rf.CommitIndex {
+		rf.CommitIndex = Int32Min(args.LeaderCommit, int32(len(rf.Logs)-1))
+		reply.LastCommitIndex = rf.CommitIndex
+		logger.Error(rf.me, "提交日志")
+		*rf.ApplyM <- ApplyMsg{
+			CommandValid: true,
+			Command:      rf.Logs[rf.CommitIndex].Command,
+			CommandIndex: int(rf.CommitIndex),
+		}
+	}
 	// 下面三行不管是心跳还是日志，都会执行
-	atomic.StoreInt32(&rf.CurrentTerm, int32(args.Term))
+	atomic.StoreInt32(&rf.CurrentTerm, args.Term)
 	atomic.StoreInt32(&rf.CurrentState, FOLLOWER)
 	reply.Term = args.Term
 
@@ -343,22 +353,23 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.VoteTimeOutTicker.Reset(time.Duration(rf.VoteTime) * time.Millisecond)
 		return
 	}
-	logger.Error(rf.me, " 收到日志：", args.Entries)
 	// Reply false if log doesn’t contain an entry at prevLogIndex
 	// whose term matches prevLogTerm (§5.3)
-	if args.PrevLogIndex >= 0 && len(rf.Logs)-1 < args.PrevLogIndex {
+	if args.PrevLogIndex >= 0 && Int32Max(int32(len(rf.Logs)-1), 0) < args.PrevLogIndex {
+		logger.Error(rf.me, " 没有 ", args.PrevLogIndex, "这个日志")
 		reply.Success = false
+		reply.LastCommitIndex = rf.CommitIndex
 		return
 	}
 	// If an existing entry conflicts with a new one (same index
 	// but different terms), delete the existing entry and all that
 	// follow it (§5.3)
-	if args.PrevLogIndex >= 0 && rf.Logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if args.PrevLogIndex >= 0 && len(rf.Logs) > 0 && rf.Logs[args.PrevLogIndex].Term != args.PrevLogTerm {
 		logger.Error(rf.me, "日志不匹配")
 		reply.Success = false
 		// 删除匹配不上的日志
-		rf.Logs = rf.Logs[:args.PrevLogIndex-1]
-		rf.CommitIndex = int32(args.PrevLogIndex - 1)
+		rf.Logs = rf.Logs[:args.PrevLogIndex]
+		rf.CommitIndex = args.PrevLogIndex - 1
 		return
 	}
 	// 此时, 要么 args.PrevLogIndex < 1 要么 rf.Logs[args.PrevLogIndex].Term == args.PrevLogTerm
@@ -367,11 +378,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reserved := If(args.PrevLogIndex < 1, 0, args.PrevLogIndex+1).(int)
 	rf.Logs = append(rf.Logs[:reserved], args.Entries...)
 
-	logger.Error(rf.me, "接受日志，本地日志为:", rf.Logs)
+	logger.Error(rf.me, " 接受日志，本地日志为:", rf.Logs)
 	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
-	if int32(args.LeaderCommit) > rf.CommitIndex {
-		rf.CommitIndex = Int32Min(int32(args.LeaderCommit), int32(len(rf.Logs) - 1))
+	// todo: 实现逻辑有错误
+	rf.CommitIndex = int32(len(rf.Logs)-1)
+	if args.LeaderCommit > rf.CommitIndex {
+		rf.CommitIndex = Int32Min(args.LeaderCommit, rf.CommitIndex)
 	}
+	reply.LastCommitIndex = rf.CommitIndex
 	reply.Success = true
 }
 
@@ -393,25 +407,25 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 	index := -1
-	term := -1
+	var term int32 = -1
 	isLeader := false
 	state := atomic.LoadInt32(&rf.CurrentState)
 	if state != LEADER {
-		return index, term, false
+		return index, int(term), false
 	}
-	term = int(atomic.LoadInt32(&rf.CurrentTerm))
+	term = atomic.LoadInt32(&rf.CurrentTerm)
 	isLeader = state == LEADER
 	newLog := Log{
 		Term:    term,
 		Command: command,
 	}
 	rf.Logs = append(rf.Logs, newLog)
-	logger.Error("收到 command, 本地 log: ", rf.Logs)
+	logger.Error(rf.me, " 收到 command, 本地 log: ", rf.Logs)
 	for i := 0; i < len(rf.Logs); i++ {
 		rf.NextIndex[i] = int32(len(rf.Logs) - 1)
 	}
 	index = len(rf.Logs) - 1
-	return index, term, isLeader
+	return index, int(term), isLeader
 }
 
 // Kill
@@ -455,6 +469,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.ApplyM = &applyCh
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.CurrentTerm = 0
@@ -472,12 +487,13 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.HeartBeatTimeOutTicker = time.NewTicker(time.Duration(rf.HeartBeatCheck))
 	rf.HeartBeatTicker = time.NewTicker(time.Duration(rf.HeartBeatSend))
 
+	//
 	rf.Logs = make([]Log, 0)
-
-	//		append(rf.Logs, Log{
-	//	Term:    0,
-	//	Command: "Init",
-	//})
+		//
+		//append(rf.Logs, Log{
+		//	Term:    0,
+		//	Command: "Init",
+		//})
 
 	// 启动心跳计时器，超时则发起选举，自己变成候选人状态
 	var ctx context.Context
@@ -517,9 +533,9 @@ func (rf *Raft) startVote(ctx context.Context) {
 			//rf.VoteFor = rf.me
 
 			args := RequestVoteArgs{
-				CandidateId:  rf.me,
-				Term:         int(term),
-				LastLogIndex: len(rf.Logs),
+				CandidateId:  int32(rf.me),
+				Term:         term,
+				LastLogIndex: int32(len(rf.Logs)),
 			}
 			if len(rf.Logs) != 0 {
 				args.LastLogTerm = rf.Logs[len(rf.Logs)-1].Term
@@ -551,8 +567,8 @@ func (rf *Raft) startVote(ctx context.Context) {
 					if v.VoteGranted {
 						cnt++
 					}
-					if v.Term > int(term) {
-						atomic.StoreInt32(&rf.CurrentTerm, int32(v.Term))
+					if v.Term > term {
+						atomic.StoreInt32(&rf.CurrentTerm, v.Term)
 						// 这里可以直接变成 follower，因为就算所有的服务器都是 follower，他们也会因为心跳超时而重新发起一轮选举
 						atomic.StoreInt32(&rf.CurrentState, FOLLOWER)
 						logger.Info("id ", rf.me, "选举失败, 收到的任期号为 ", v.Term, ", 自己的任期号为", term, "收到的任期是 ", v.Term)
@@ -614,53 +630,59 @@ func (rf *Raft) sendHearBeatsClock(ctx context.Context) {
 			logger.Debug("id ", rf.me, " 发送心跳")
 			term := atomic.LoadInt32(&rf.CurrentTerm)
 			args := AppendEntriesArgs{
-				Term:         int(term),
-				LeaderId:     rf.me,
-				PrevLogIndex: len(rf.Logs) - 1,
+				Term:         term,
+				LeaderId:     int32(rf.me),
+				LeaderCommit: rf.CommitIndex,
 			}
-			// todo
-			if len(rf.Logs) != 0 {
-				args.PrevLogTerm = rf.Logs[len(rf.Logs)-1].Term
-			}
-
 			replies := make([]AppendEntriesReply, len(rf.peers))
-			var noReplyNumber int32 = 0
+			var noReplyNumber, commitNumber int32 = 0, 0
 			for idx, server := range rf.peers {
 				idx := idx
 				server := server
 				args := args
 				if idx != rf.me {
-					// 向 follower 发送其没有的日志
-					if int(rf.NextIndex[idx]) <= len(rf.Logs)-1 || int(rf.MatchIndex[idx]) <= len(rf.Logs)-1 {
-						args.Entries = rf.Logs[Int32Min(rf.NextIndex[idx], rf.MatchIndex[idx]):]
-						logger.Error("nextIndex: ", rf.NextIndex[idx], ", matchIndex: ", rf.MatchIndex[idx], ", ", rf.me, "向", idx, "心跳附加日志：", args.Entries)
-					}
 					go func() {
 					start:
+						// 向 follower 发送其没有的日志
+						if rf.NextIndex[idx] <= int32(len(rf.Logs)-1) {
+							args.Entries = rf.Logs[rf.NextIndex[idx]:]
+							args.PrevLogIndex = rf.MatchIndex[idx]
+							args.PrevLogTerm = rf.Logs[rf.MatchIndex[idx]].Term
+
+							rf.NextIndex[idx]++
+							logger.Error("nextIndex: ", rf.NextIndex[idx], ", matchIndex: ", rf.MatchIndex[idx], ", ", rf.me, "向", idx, "心跳附加日志：", args.Entries)
+						}
+						var once sync.Once
 						for !server.Call("Raft.AppendEntries", &args, &(replies[idx])) {
-							atomic.AddInt32(&noReplyNumber, 1)
+							once.Do(func() {
+								atomic.AddInt32(&noReplyNumber, 1)
+							})
 							logger.Warn(rf.me, "给 ", idx, " 发的心跳没有得到回复")
 							if args.Entries == nil {
 								break
 							}
 						}
-						if replies[idx].Term > int(term) {
+						// 处理心跳的情况
+						if replies[idx].Term > term {
 							// 收到的 CurrentTerm 比自己的大
-							atomic.StoreInt32(&rf.CurrentTerm, int32(replies[idx].Term))
+							atomic.StoreInt32(&rf.CurrentTerm, replies[idx].Term)
 							atomic.StoreInt32(&rf.CurrentState, FOLLOWER)
 							return
 						}
-						// false 只可能是 log 对不上
+						// 此处的 false 只可能是 log 对不上
 						if replies[idx].Success == false {
 							logger.Error("log 对不上")
-							rf.MatchIndex[idx] = int32(replies[idx].LastCommitIndex)
-							rf.NextIndex[idx] = int32(replies[idx].LastCommitIndex)
+							// todo: 可优化
+							rf.MatchIndex[idx] = Int32Max(rf.MatchIndex[idx]-1, -1)
+							// 重置 nextIndex, 并重发
+							rf.NextIndex[idx] = rf.MatchIndex[idx] + 1
 							goto start
 						}
-						if args.Entries != nil {
-							logger.Error("log 传输完毕")
-							rf.MatchIndex[idx] = int32(replies[idx].LastCommitIndex + 1)
-							rf.NextIndex[idx] = int32(replies[idx].LastCommitIndex + 1)
+						// 采用累积重传
+						if len(args.Entries) != 0 {
+							logger.Error(idx, " 已经成功 commit ", replies[idx].LastCommitIndex)
+							atomic.AddInt32(&commitNumber, 1)
+							rf.MatchIndex[idx] = replies[idx].LastCommitIndex
 						}
 					}()
 				}
@@ -668,22 +690,31 @@ func (rf *Raft) sendHearBeatsClock(ctx context.Context) {
 			time.Sleep(100 * time.Millisecond)
 
 			// 处理在 lab 2a中的特殊情况：出现分区后，自己要降级为 follower
-			if int(atomic.LoadInt32(&noReplyNumber)) > len(rf.peers)/2 {
+			if atomic.LoadInt32(&noReplyNumber) > int32(len(rf.peers)/2) {
 				logger.Error(rf.me, "发送的心跳有", noReplyNumber, "人都没有回复")
 				atomic.StoreInt32(&rf.CurrentState, FOLLOWER)
+				continue
+			}
+			if atomic.LoadInt32(&commitNumber) > int32(len(rf.peers)/2) {
+				// 超过半数回复了
+				var committed int32
+				for i, v := range rf.MatchIndex {
+					if i!=rf.me{
+						fmt.Println(i," ", v)
+						committed = Int32Min(committed, v)
+					}
+				}
+				rf.CommitIndex = committed
+				logger.Error(rf.me, "准备提交日志")
+				*rf.ApplyM <- ApplyMsg{
+					CommandValid: true,
+					CommandIndex: int(committed),
+					Command:      rf.Logs[committed].Command,
+				}
+
 			}
 		case <-ctx.Done():
 			return
 		}
 	}
-}
-
-func (rf *Raft) appendNewEntry(cmd interface{}) Log {
-	term := int(atomic.LoadInt32(&rf.CurrentTerm))
-	logs := Log{
-		Term:    term,
-		Command: cmd,
-	}
-	rf.Logs = append(rf.Logs, logs)
-	return logs
 }

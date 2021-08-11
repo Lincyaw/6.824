@@ -18,6 +18,20 @@ func Int32Min(a,b int32) int32 {
 	}
 	return a
 }
+func Int32Max(a int32, b int32) int32 {
+	if a<b {
+		return b
+	}
+	return a
+}
+
+func Max(a, b interface{}) interface{} {
+	if a.(int32) < b.(int32) {
+	    return b
+	}else{
+		return a
+	}
+}
 
 func IntMax(a,b int) int {
 	if a<b {

@@ -34,3 +34,8 @@
 lastApplied 与 commitIndex 之间可能会存在不一致，因为对于 master 来说，一条日志被 apply 后，还需要等待半数以上的节点同意，才能被标记为 commit。
 
 > 问题：对于从节点，commitIndex 在何时更新呢？在收到来自 master 的新日志之后，马上就认为这条日志被 commit 吗？
+
+不是的。看 AppendEntries RPC 的第 5 条规则：  If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)。
+从节点的 commitIndex 是根据两者的较小值来决定的。
+
+也就是说，如果想要在从节点上 commit 一条 log，至少需要 2 次 RPC。并且，master 的 commitIndex 经常会与从节点的 commitIndex 有延迟。
