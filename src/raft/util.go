@@ -25,3 +25,10 @@ func IntMax(a,b int) int {
 	}
 	return a
 }
+
+func If(condition bool, trueVal, falseVal interface{}) interface{} {
+	if condition {
+		return trueVal
+	}
+	return falseVal
+}

@@ -114,12 +114,12 @@ type Raft struct {
 func (rf *Raft) String() string {
 	b, err := json.Marshal(rf)
 	if err != nil {
-		return fmt.Sprintf("%+v", rf)
+		return fmt.Sprintf("%v", b)
 	}
 	var out bytes.Buffer
 	err = json.Indent(&out, b, "", "    ")
 	if err != nil {
-		return fmt.Sprintf("%+v", rf)
+		return fmt.Sprintf("%+v", out)
 	}
 	return out.String()
 }
@@ -324,13 +324,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	term := atomic.LoadInt32(&rf.CurrentTerm)
 	logger.Trace(rf.me, " 收到 id ", args.LeaderId, "的心跳请求，其任期为 ", args.Term, " 自己的任期为 ", term)
 
-	// 自己的任期号比发来的心跳的大
+	// 自己的任期号比发来的心跳的大 §5.1
 	if args.Term < int(term) {
 		reply.Term = int(rf.CurrentTerm)
 		reply.Success = false
 		return
 	}
-	// 下面三行, 不管
+	// 下面三行不管是心跳还是日志，都会执行
 	atomic.StoreInt32(&rf.CurrentTerm, int32(args.Term))
 	atomic.StoreInt32(&rf.CurrentState, FOLLOWER)
 	reply.Term = args.Term
@@ -344,43 +344,35 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 	logger.Error(rf.me, " 收到日志：", args.Entries)
-	// 接受日志，先检查已有的部分是否与 leader 一致
-	if args.PrevLogIndex >= 0 && (len(rf.Logs)-1 < args.PrevLogIndex || rf.Logs[args.PrevLogIndex].Term != args.PrevLogTerm) {
-		logger.Error(rf.me, "日志不匹配")
-		if args.PrevLogIndex >= 0 && len(rf.Logs) > args.PrevLogIndex {
-			logger.Error(rf.Logs[args.PrevLogIndex].Term, "  ", args.PrevLogTerm)
-		}
-		reply.LastCommitIndex = IntMax(len(rf.Logs)-1, 0)
-		// 本地日志长度比远端的长,则舍弃多出来的
-		if reply.LastCommitIndex > args.PrevLogIndex {
-			reply.LastCommitIndex = IntMax(args.PrevLogIndex, 0)
-		}
-		// 一直往前找,直到找到匹配的项
-		for reply.LastCommitIndex > 0 {
-			if rf.Logs[reply.LastCommitIndex].Term != args.Term {
-				reply.LastCommitIndex--
-			} else {
-				break
-			}
-		}
-		// 删除匹配不上的日志
-		rf.Logs = rf.Logs[:reply.LastCommitIndex]
-		rf.CommitIndex = int32(reply.LastCommitIndex)
-		// 此时, 返回值 reply 中, 包含了最后一条与 leader 匹配上的日志的 index, 记作 LastCommitIndex
-		// 要求 leader 需要重发这个 LastCommitIndex 之后的所有的 log
+	// Reply false if log doesn’t contain an entry at prevLogIndex
+	// whose term matches prevLogTerm (§5.3)
+	if args.PrevLogIndex >= 0 && len(rf.Logs)-1 < args.PrevLogIndex {
 		reply.Success = false
 		return
 	}
+	// If an existing entry conflicts with a new one (same index
+	// but different terms), delete the existing entry and all that
+	// follow it (§5.3)
+	if args.PrevLogIndex >= 0 && rf.Logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+		logger.Error(rf.me, "日志不匹配")
+		reply.Success = false
+		// 删除匹配不上的日志
+		rf.Logs = rf.Logs[:args.PrevLogIndex-1]
+		rf.CommitIndex = int32(args.PrevLogIndex - 1)
+		return
+	}
+	// 此时, 要么 args.PrevLogIndex < 1 要么 rf.Logs[args.PrevLogIndex].Term == args.PrevLogTerm
+	// 这两者都可以执行 Append any new entries not already in the log 的操作
+	// 为了防止收到重复的消息，需要确保这里的幂等性。先把对应上的 log 之后的所有 log 删除
+	reserved := If(args.PrevLogIndex < 1, 0, args.PrevLogIndex+1).(int)
+	rf.Logs = append(rf.Logs[:reserved], args.Entries...)
 
-	rf.Logs = append(rf.Logs, args.Entries...)
-	rf.Logs = rf.Logs[:args.PrevLogIndex+1] // 这行应该不需要，因为上面的代码一定是把不一致的日志拦截了
 	logger.Error(rf.me, "接受日志，本地日志为:", rf.Logs)
-	rf.CommitIndex = int32(len(rf.Logs) - 1)
-	//if int32(args.LeaderCommit) > rf.CommitIndex {
-	//	rf.CommitIndex = Int32Min(int32(args.LeaderCommit), rf.CommitIndex)
-	//}
+	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
+	if int32(args.LeaderCommit) > rf.CommitIndex {
+		rf.CommitIndex = Int32Min(int32(args.LeaderCommit), int32(len(rf.Logs) - 1))
+	}
 	reply.Success = true
-	reply.LastCommitIndex = int(rf.CommitIndex)
 }
 
 // Start
@@ -626,6 +618,7 @@ func (rf *Raft) sendHearBeatsClock(ctx context.Context) {
 				LeaderId:     rf.me,
 				PrevLogIndex: len(rf.Logs) - 1,
 			}
+			// todo
 			if len(rf.Logs) != 0 {
 				args.PrevLogTerm = rf.Logs[len(rf.Logs)-1].Term
 			}
