@@ -330,16 +330,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		return
 	}
-	if args.LeaderCommit > rf.CommitIndex {
-		rf.CommitIndex = Int32Min(args.LeaderCommit, int32(len(rf.Logs)-1))
-		reply.LastCommitIndex = rf.CommitIndex
-		logger.Error(rf.me, "提交日志")
-		*rf.ApplyM <- ApplyMsg{
-			CommandValid: true,
-			Command:      rf.Logs[rf.CommitIndex].Command,
-			CommandIndex: int(rf.CommitIndex),
-		}
-	}
+
 	// 下面三行不管是心跳还是日志，都会执行
 	atomic.StoreInt32(&rf.CurrentTerm, args.Term)
 	atomic.StoreInt32(&rf.CurrentState, FOLLOWER)
@@ -351,6 +342,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// 收到心跳后，应该抑制其变为 candidate, 并且抑制其发起选举
 		rf.HeartBeatTimeOutTicker.Reset(time.Duration(rf.HeartBeatCheck) * time.Millisecond)
 		rf.VoteTimeOutTicker.Reset(time.Duration(rf.VoteTime) * time.Millisecond)
+
+		// 到底是在什么时候 apply 呢？ 在收到心跳的时候， master可以发送一个 commitIndex，让slave检测log是否正确commit
+		if args.LeaderCommit > rf.CommitIndex && len(rf.Logs) > 0 && args.LeaderCommit >= 0 {
+			rf.CommitIndex = Int32Min(args.LeaderCommit, int32(len(rf.Logs)-1))
+			reply.LastCommitIndex = rf.CommitIndex
+			logger.Error(rf.me, "在收到心跳时，提交日志", args.LeaderCommit)
+			*rf.ApplyM <- ApplyMsg{
+				CommandValid: true,
+				Command:      rf.Logs[rf.CommitIndex].Command,
+				CommandIndex: int(rf.CommitIndex),
+			}
+		}
+
 		return
 	}
 	// Reply false if log doesn’t contain an entry at prevLogIndex
@@ -375,17 +379,25 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 此时, 要么 args.PrevLogIndex < 1 要么 rf.Logs[args.PrevLogIndex].Term == args.PrevLogTerm
 	// 这两者都可以执行 Append any new entries not already in the log 的操作
 	// 为了防止收到重复的消息，需要确保这里的幂等性。先把对应上的 log 之后的所有 log 删除
-	reserved := If(args.PrevLogIndex < 1, 0, args.PrevLogIndex+1).(int)
-	rf.Logs = append(rf.Logs[:reserved], args.Entries...)
+
+	reserved := 0
+	if args.PrevLogIndex >= 0  {
+		reserved = int(args.PrevLogIndex + 1)
+	}
+	if len(rf.Logs)!=0 {
+		rf.Logs = append(rf.Logs[:reserved], args.Entries...)
+	}else{
+		rf.Logs = append(rf.Logs, args.Entries...)
+	}
 
 	logger.Error(rf.me, " 接受日志，本地日志为:", rf.Logs)
 	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
 	// todo: 实现逻辑有错误
-	rf.CommitIndex = int32(len(rf.Logs)-1)
-	if args.LeaderCommit > rf.CommitIndex {
-		rf.CommitIndex = Int32Min(args.LeaderCommit, rf.CommitIndex)
-	}
-	reply.LastCommitIndex = rf.CommitIndex
+	//rf.CommitIndex = int32(len(rf.Logs) - 1)
+	//if args.LeaderCommit > rf.CommitIndex {
+	//	rf.CommitIndex = Int32Min(args.LeaderCommit, rf.CommitIndex)
+	//}
+	reply.LastCommitIndex = int32(len(rf.Logs) - 1)
 	reply.Success = true
 }
 
@@ -478,7 +490,9 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.VoteFor = -1
 	rf.NextIndex = make([]int32, len(peers))
 	rf.MatchIndex = make([]int32, len(peers))
-
+	for i := range rf.MatchIndex {
+		rf.MatchIndex[i] = -1
+	}
 	rf.HeartBeatCheck = 220
 	rf.HeartBeatSend = 105
 	rf.VoteTime = rand.Intn(150) + 150
@@ -489,11 +503,11 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 
 	//
 	rf.Logs = make([]Log, 0)
-		//
-		//append(rf.Logs, Log{
-		//	Term:    0,
-		//	Command: "Init",
-		//})
+	//
+	//append(rf.Logs, Log{
+	//	Term:    0,
+	//	Command: "Init",
+	//})
 
 	// 启动心跳计时器，超时则发起选举，自己变成候选人状态
 	var ctx context.Context
@@ -648,9 +662,8 @@ func (rf *Raft) sendHearBeatsClock(ctx context.Context) {
 							args.Entries = rf.Logs[rf.NextIndex[idx]:]
 							args.PrevLogIndex = rf.MatchIndex[idx]
 							args.PrevLogTerm = rf.Logs[rf.MatchIndex[idx]].Term
-
+							logger.Error("rf.MatchIndex[idx]: ", args.PrevLogIndex, " term: ", args.PrevLogTerm, ", ", rf.me, "向", idx, "心跳附加", rf.NextIndex[idx], "及其之后的日志：", args.Entries)
 							rf.NextIndex[idx]++
-							logger.Error("nextIndex: ", rf.NextIndex[idx], ", matchIndex: ", rf.MatchIndex[idx], ", ", rf.me, "向", idx, "心跳附加日志：", args.Entries)
 						}
 						var once sync.Once
 						for !server.Call("Raft.AppendEntries", &args, &(replies[idx])) {
@@ -695,21 +708,26 @@ func (rf *Raft) sendHearBeatsClock(ctx context.Context) {
 				atomic.StoreInt32(&rf.CurrentState, FOLLOWER)
 				continue
 			}
-			if atomic.LoadInt32(&commitNumber) > int32(len(rf.peers)/2) {
+			if atomic.LoadInt32(&commitNumber) >= int32(len(rf.peers)/2) {
 				// 超过半数回复了
 				var committed int32
+				committed = 99999
 				for i, v := range rf.MatchIndex {
-					if i!=rf.me{
-						fmt.Println(i," ", v)
+					if i != rf.me {
+						fmt.Println("服务器 ", i, " 的匹配上的目录是", v)
 						committed = Int32Min(committed, v)
 					}
 				}
-				rf.CommitIndex = committed
-				logger.Error(rf.me, "准备提交日志")
+				rf.CommitIndex = Int32Min(committed, rf.CommitIndex+1)
+				logger.Error(rf.me, " 提交日志 ", rf.CommitIndex, ApplyMsg{
+					CommandValid: true,
+					CommandIndex: int(rf.CommitIndex),
+					Command:      rf.Logs[rf.CommitIndex].Command,
+				})
 				*rf.ApplyM <- ApplyMsg{
 					CommandValid: true,
-					CommandIndex: int(committed),
-					Command:      rf.Logs[committed].Command,
+					CommandIndex: int(rf.CommitIndex),
+					Command:      rf.Logs[rf.CommitIndex].Command,
 				}
 
 			}
