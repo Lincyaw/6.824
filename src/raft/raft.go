@@ -587,7 +587,8 @@ func (rf *Raft) startVote(ctx context.Context) {
 					}()
 				}
 			}
-			time.Sleep(100 * time.Millisecond)
+			// 稍微比协程内的长一点, 保证此时关闭 channel 后, 不会再有新的内容写入 channel
+			time.Sleep(101 * time.Millisecond)
 			chanLock.Lock()
 			close(reps)
 			chanLock.Unlock()
