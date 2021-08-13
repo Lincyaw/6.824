@@ -120,7 +120,7 @@ func TestBasicAgree2B(t *testing.T) {
 			t.Fatalf("some have committed before Start()")
 		}
 		xindex := cfg.one(index*100, servers, false)
-		//log.Error(xindex," ", index)
+		log.Error(xindex," ", index)
 		if xindex+1 != index {
 			t.Fatalf("got index %v but expected %v", xindex, index)
 		}

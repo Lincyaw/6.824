@@ -143,7 +143,6 @@ func ReduceWork(reducef func(string, []string) string, reply ReplyWorker) bool {
 		var kv KeyValue
 		for decoder.More() {
 			if err := decoder.Decode(&kv); err != nil {
-				// todo: here always have problems
 				log.Fatal("Json decode failed, ", err)
 			}
 			intermediate = append(intermediate, kv)

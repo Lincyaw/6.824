@@ -43,7 +43,7 @@ func init() {
 	} else {
 		logger.Info("Failed to log to file, using default stderr")
 	}
-	logger.SetLevel(logrus.ErrorLevel)
+	logger.SetLevel(logrus.FatalLevel)
 }
 
 // import "bytes"
@@ -76,6 +76,7 @@ const (
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
+	// 目前这个锁只在锁 log 的部分用了. 顺便锁了 数据操作频繁 的临界区
 	mu        sync.Mutex // Lock to protect shared access to this peer's state
 	voteLock  sync.Mutex
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
@@ -239,10 +240,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.voteLock.Lock()
 	defer rf.voteLock.Unlock()
 	term := atomic.LoadInt32(&rf.CurrentTerm)
+	rf.mu.Lock()
 	var lastLogTerm, lastLogIndex int32 = 0, int32(len(rf.Logs))
 	if len(rf.Logs) != 0 {
 		lastLogTerm = rf.Logs[len(rf.Logs)-1].Term
 	}
+	rf.mu.Unlock()
+
 	if term > args.Term {
 		reply.VoteGranted = false
 		reply.Term = term
@@ -326,7 +330,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// 自己的任期号比发来的心跳的大 §5.1
 	if args.Term < term {
-		reply.Term = rf.CurrentTerm
+		reply.Term = term
 		reply.Success = false
 		return
 	}
@@ -381,12 +385,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 为了防止收到重复的消息，需要确保这里的幂等性。先把对应上的 log 之后的所有 log 删除
 
 	reserved := 0
-	if args.PrevLogIndex >= 0  {
+	if args.PrevLogIndex >= 0 {
 		reserved = int(args.PrevLogIndex + 1)
 	}
-	if len(rf.Logs)!=0 {
+	if len(rf.Logs) != 0 {
 		rf.Logs = append(rf.Logs[:reserved], args.Entries...)
-	}else{
+	} else {
 		rf.Logs = append(rf.Logs, args.Entries...)
 	}
 
@@ -431,10 +435,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Term:    term,
 		Command: command,
 	}
+	rf.mu.Lock()
 	rf.Logs = append(rf.Logs, newLog)
+	rf.mu.Unlock()
 	logger.Error(rf.me, " 收到 command, 本地 log: ", rf.Logs)
 	for i := 0; i < len(rf.Logs); i++ {
-		rf.NextIndex[i] = int32(len(rf.Logs) - 1)
+		atomic.StoreInt32(&rf.NextIndex[i], int32(len(rf.Logs)-1))
 	}
 	index = len(rf.Logs) - 1
 	return index, int(term), isLeader
@@ -555,50 +561,56 @@ func (rf *Raft) startVote(ctx context.Context) {
 				args.LastLogTerm = rf.Logs[len(rf.Logs)-1].Term
 			}
 			// 在这里发起一次选举，向所有的 server 发送选举请求
-			replies := make([]RequestVoteReply, len(rf.peers))
+			reps := make(chan RequestVoteReply, len(rf.peers))
+			chanLock := sync.Mutex {}
 			for idx, server := range rf.peers {
 				if idx != rf.me {
 					idx := idx
 					server := server
+					ok := make(chan bool, 1)
 					go func() {
 						logger.Trace(rf.me, " 向 ", idx, " 发送了选举请求")
-						//rf.mu.Lock()
-						ok := server.Call("Raft.RequestVote", &args, &(replies[idx]))
-						//rf.mu.Unlock()
-						if !ok {
-							logger.Warn(rf.me, "给 ", idx, " 发的选举没有得到回复")
-						} else {
-							logger.Trace(rf.me, " 收到的选举回复, CurrentTerm:", replies[idx].Term, ", Agree? ", replies[idx].VoteGranted)
+						rep := RequestVoteReply{}
+						select {
+						case <-time.After(100 * time.Millisecond):
+							return
+						case ok <- server.Call("Raft.RequestVote", &args, &(rep)):
+							if !<-ok {
+								logger.Warn(rf.me, "给 ", idx, " 发的选举没有得到回复")
+							} else {
+								chanLock.Lock()
+								reps <- rep
+								chanLock.Unlock()
+								logger.Trace(rf.me, " 收到的选举回复, CurrentTerm:", rep.Term, ", Agree? ", rep.VoteGranted)
+							}
 						}
 					}()
 				}
 			}
 			time.Sleep(100 * time.Millisecond)
-			// todo: 此处存在一个 race 隐患, 不加锁的话, 会导致并发读写 replies；加锁的话又会导致无法及时统计自己是否当选
-			//rf.mu.Lock()
-			for idx, v := range replies {
-				if idx != rf.me {
-					if v.VoteGranted {
-						cnt++
-					}
-					if v.Term > term {
-						atomic.StoreInt32(&rf.CurrentTerm, v.Term)
-						// 这里可以直接变成 follower，因为就算所有的服务器都是 follower，他们也会因为心跳超时而重新发起一轮选举
-						atomic.StoreInt32(&rf.CurrentState, FOLLOWER)
-						logger.Info("id ", rf.me, "选举失败, 收到的任期号为 ", v.Term, ", 自己的任期号为", term, "收到的任期是 ", v.Term)
-						goto CON
-					}
+			chanLock.Lock()
+			close(reps)
+			chanLock.Unlock()
+			for v := range reps {
+				if v.VoteGranted {
+					cnt++
+				}
+				if v.Term > term {
+					atomic.StoreInt32(&rf.CurrentTerm, v.Term)
+					// 这里可以直接变成 follower，因为就算所有的服务器都是 follower，他们也会因为心跳超时而重新发起一轮选举
+					atomic.StoreInt32(&rf.CurrentState, FOLLOWER)
+					logger.Info("id ", rf.me, "选举失败, 收到的任期号为 ", v.Term, ", 自己的任期号为", term, "收到的任期是 ", v.Term)
+					goto CON
 				}
 			}
-			//rf.mu.Unlock()
 
 			logger.Debug("id ", rf.me, "获得选票", cnt, "张，总共有", len(rf.peers), "人")
 			// 获胜则变成 leader，没获胜则依旧是 candidate，继续选举
 			if cnt > len(rf.peers)/2 {
 				atomic.StoreInt32(&rf.CurrentState, LEADER)
 				for i := 0; i < len(rf.NextIndex); i++ {
-					rf.NextIndex[i] = 0
-					rf.MatchIndex[i] = 0
+					atomic.StoreInt32(&rf.NextIndex[i], 0)
+					atomic.StoreInt32(&rf.MatchIndex[i], 0)
 				}
 			}
 		CON:
@@ -658,13 +670,15 @@ func (rf *Raft) sendHearBeatsClock(ctx context.Context) {
 					go func() {
 					start:
 						// 向 follower 发送其没有的日志
-						if rf.NextIndex[idx] <= int32(len(rf.Logs)-1) {
+						rf.mu.Lock()
+						if atomic.LoadInt32(&rf.NextIndex[idx]) <= int32(len(rf.Logs)-1) {
 							args.Entries = rf.Logs[rf.NextIndex[idx]:]
 							args.PrevLogIndex = rf.MatchIndex[idx]
 							args.PrevLogTerm = rf.Logs[rf.MatchIndex[idx]].Term
 							logger.Error("rf.MatchIndex[idx]: ", args.PrevLogIndex, " term: ", args.PrevLogTerm, ", ", rf.me, "向", idx, "心跳附加", rf.NextIndex[idx], "及其之后的日志：", args.Entries)
 							rf.NextIndex[idx]++
 						}
+						rf.mu.Unlock()
 						var once sync.Once
 						for !server.Call("Raft.AppendEntries", &args, &(replies[idx])) {
 							once.Do(func() {
@@ -683,19 +697,19 @@ func (rf *Raft) sendHearBeatsClock(ctx context.Context) {
 							return
 						}
 						// 此处的 false 只可能是 log 对不上
-						if replies[idx].Success == false {
+						if len(args.Entries) != 0 && replies[idx].Success == false {
 							logger.Error("log 对不上")
 							// todo: 可优化
-							rf.MatchIndex[idx] = Int32Max(rf.MatchIndex[idx]-1, -1)
+							atomic.StoreInt32(&rf.MatchIndex[idx], Int32Max(atomic.LoadInt32(&rf.MatchIndex[idx])-1, -1))
 							// 重置 nextIndex, 并重发
-							rf.NextIndex[idx] = rf.MatchIndex[idx] + 1
+							atomic.StoreInt32(&rf.NextIndex[idx], atomic.LoadInt32(&rf.MatchIndex[idx])+1)
 							goto start
 						}
 						// 采用累积重传
 						if len(args.Entries) != 0 {
 							logger.Error(idx, " 已经成功 commit ", replies[idx].LastCommitIndex)
 							atomic.AddInt32(&commitNumber, 1)
-							rf.MatchIndex[idx] = replies[idx].LastCommitIndex
+							atomic.StoreInt32(&rf.MatchIndex[idx], replies[idx].LastCommitIndex)
 						}
 					}()
 				}
@@ -712,10 +726,10 @@ func (rf *Raft) sendHearBeatsClock(ctx context.Context) {
 				// 超过半数回复了
 				var committed int32
 				committed = 99999
-				for i, v := range rf.MatchIndex {
+				for i, _ := range rf.MatchIndex {
 					if i != rf.me {
-						fmt.Println("服务器 ", i, " 的匹配上的目录是", v)
-						committed = Int32Min(committed, v)
+						fmt.Println("服务器 ", i, " 的匹配上的目录是", rf.MatchIndex[i])
+						committed = Int32Min(committed, rf.MatchIndex[i])
 					}
 				}
 				rf.CommitIndex = Int32Min(committed, rf.CommitIndex+1)
