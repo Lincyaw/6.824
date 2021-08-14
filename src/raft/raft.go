@@ -43,7 +43,7 @@ func init() {
 	} else {
 		logger.Info("Failed to log to file, using default stderr")
 	}
-	logger.SetLevel(logrus.FatalLevel)
+	logger.SetLevel(logrus.TraceLevel)
 }
 
 // import "bytes"
