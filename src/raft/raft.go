@@ -729,8 +729,8 @@ func (rf *Raft) sendHearBeatsClock(ctx context.Context) {
 				committed = 99999
 				for i, _ := range rf.MatchIndex {
 					if i != rf.me {
-						fmt.Println("服务器 ", i, " 的匹配上的目录是", rf.MatchIndex[i])
-						committed = Int32Min(committed, rf.MatchIndex[i])
+						fmt.Println("服务器 ", i, " 的匹配上的目录是", atomic.LoadInt32(&rf.MatchIndex[i]))
+						committed = Int32Min(committed, atomic.LoadInt32(&rf.MatchIndex[i]))
 					}
 				}
 				rf.CommitIndex = Int32Min(committed, rf.CommitIndex+1)
