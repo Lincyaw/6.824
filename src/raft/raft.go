@@ -738,7 +738,7 @@ func (rf *Raft) sendHearBeatsClock(ctx context.Context) {
 				// 但实际上最小的那个 slave 可能已经挂了。
 				var committed int32
 				committed = 99999
-				for i, _ := range rf.MatchIndex {
+				for i:= range rf.MatchIndex {
 					if i != rf.me {
 						logger.Error("服务器 ", i, " 的匹配上的目录是", atomic.LoadInt32(&rf.MatchIndex[i]))
 						committed = Int32Min(committed, atomic.LoadInt32(&rf.MatchIndex[i]))

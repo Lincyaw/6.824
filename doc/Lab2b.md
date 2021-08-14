@@ -39,3 +39,35 @@ lastApplied 与 commitIndex 之间可能会存在不一致，因为对于 master
 从节点的 commitIndex 是根据两者的较小值来决定的。
 
 也就是说，如果想要在从节点上 commit 一条 log，至少需要 2 次 RPC。并且，master 的 commitIndex 经常会与从节点的 commitIndex 有延迟。
+
+
+## 出现的问题
+
+1. 日志 index 与测试需求不匹配：例如 TestBasicAgree2B 函数中的这一段
+
+```go
+for index := 1; index < iters+1; index++ {
+    nd, _ := cfg.nCommitted(index)
+    if nd > 0 {
+        t.Fatalf("some have committed before Start()")
+    }
+    // todo: 此处有几率 fail, 这里一开始就没处理好
+    xindex := cfg.one(index*100, servers, false)
+    // todo: 此处原本是 xindex != index, 但我自己的实现与其 test 要求的全部相差了一个 1.
+    if xindex+1 != index {
+        t.Fatalf("got index %v but expected %v", xindex, index)
+    }
+}
+```
+
+2. commit 日志的时候，发生越界
+
+```go
+rf.mu.Lock()
+*rf.ApplyM <- ApplyMsg{
+    CommandValid: true,
+    CommandIndex: int(rf.CommitIndex),
+    Command:      rf.Logs[rf.CommitIndex].Command, // todo：此处会出现 rf.CommitIndex 越界的情况
+}
+rf.mu.Unlock()
+```
