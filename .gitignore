@@ -4,3 +4,4 @@ api.key
 src/main/mr-*
 .idea
 src/raft/logs
+src/raft/test_logs

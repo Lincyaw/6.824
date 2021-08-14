@@ -348,7 +348,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.VoteTimeOutTicker.Reset(time.Duration(rf.VoteTime) * time.Millisecond)
 
 		// 到底是在什么时候 apply 呢？ 在收到心跳的时候， master可以发送一个 commitIndex，让slave检测log是否正确commit
-		if args.LeaderCommit > rf.CommitIndex && len(rf.Logs) > 0 && args.LeaderCommit >= 0 {
+		if args.LeaderCommit > atomic.LoadInt32(&rf.CommitIndex) && len(rf.Logs) > 0 && args.LeaderCommit >= 0 {
 			rf.CommitIndex = Int32Min(args.LeaderCommit, int32(len(rf.Logs)-1))
 			reply.LastCommitIndex = rf.CommitIndex
 			logger.Error(rf.me, "在收到心跳时，提交日志", args.LeaderCommit)
@@ -388,13 +388,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.PrevLogIndex >= 0 {
 		reserved = int(args.PrevLogIndex + 1)
 	}
+	rf.mu.Lock()
 	if len(rf.Logs) != 0 {
 		rf.Logs = append(rf.Logs[:reserved], args.Entries...)
 	} else {
 		rf.Logs = append(rf.Logs, args.Entries...)
 	}
+	rf.mu.Unlock()
 
-	logger.Error(rf.me, " 接受日志，本地日志为:", rf.Logs)
+	//logger.Error(rf.me, " 接受日志，本地日志为:", rf.Logs)
+	logger.Error(rf.me, " 接受日志")
 	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
 	// todo: 实现逻辑有错误
 	//rf.CommitIndex = int32(len(rf.Logs) - 1)
@@ -436,13 +439,16 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Command: command,
 	}
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
 	rf.Logs = append(rf.Logs, newLog)
-	rf.mu.Unlock()
-	logger.Error(rf.me, " 收到 command, 本地 log: ", rf.Logs)
-	for i := 0; i < len(rf.Logs); i++ {
+	//logger.Error(rf.me, " 收到 command, 本地 log: ", rf.Logs)
+	logger.Error(rf.me, " 收到 command， 日志长度为 ",len(rf.Logs))
+	for i := 0; i < len(rf.peers); i++ {
 		atomic.StoreInt32(&rf.NextIndex[i], int32(len(rf.Logs)-1))
 	}
 	index = len(rf.Logs) - 1
+
 	return index, int(term), isLeader
 }
 
@@ -551,7 +557,7 @@ func (rf *Raft) startVote(ctx context.Context) {
 			// 自己给自己投票
 			cnt := 1
 			//rf.VoteFor = rf.me
-
+			rf.mu.Lock()
 			args := RequestVoteArgs{
 				CandidateId:  int32(rf.me),
 				Term:         term,
@@ -560,6 +566,7 @@ func (rf *Raft) startVote(ctx context.Context) {
 			if len(rf.Logs) != 0 {
 				args.LastLogTerm = rf.Logs[len(rf.Logs)-1].Term
 			}
+			rf.mu.Unlock()
 			// 在这里发起一次选举，向所有的 server 发送选举请求
 			reps := make(chan RequestVoteReply, len(rf.peers))
 			chanLock := sync.Mutex {}
@@ -673,10 +680,11 @@ func (rf *Raft) sendHearBeatsClock(ctx context.Context) {
 						// 向 follower 发送其没有的日志
 						rf.mu.Lock()
 						if atomic.LoadInt32(&rf.NextIndex[idx]) <= int32(len(rf.Logs)-1) {
-							args.Entries = rf.Logs[rf.NextIndex[idx]:]
-							args.PrevLogIndex = rf.MatchIndex[idx]
-							args.PrevLogTerm = rf.Logs[rf.MatchIndex[idx]].Term
-							logger.Error("rf.MatchIndex[idx]: ", args.PrevLogIndex, " term: ", args.PrevLogTerm, ", ", rf.me, "向", idx, "心跳附加", rf.NextIndex[idx], "及其之后的日志：", args.Entries)
+							args.Entries = rf.Logs[atomic.LoadInt32(&rf.NextIndex[idx]):]
+							args.PrevLogIndex = atomic.LoadInt32(&rf.MatchIndex[idx])
+							args.PrevLogTerm = rf.Logs[args.PrevLogIndex].Term
+							//logger.Error("rf.MatchIndex[idx]: ", args.PrevLogIndex, " term: ", args.PrevLogTerm, ", ", rf.me, "向", idx, "心跳附加", rf.NextIndex[idx], "及其之后的日志：", args.Entries)
+							logger.Error("rf.MatchIndex[idx]: ", args.PrevLogIndex, " term: ", args.PrevLogTerm, ", ", rf.me, "向", idx, "心跳附加", rf.NextIndex[idx])
 							rf.NextIndex[idx]++
 						}
 						rf.mu.Unlock()
@@ -725,25 +733,32 @@ func (rf *Raft) sendHearBeatsClock(ctx context.Context) {
 			}
 			if atomic.LoadInt32(&commitNumber) >= int32(len(rf.peers)/2) {
 				// 超过半数回复了
+				// todo: 潜在的bug。此处应该统计超过半数的 commitindex 。 \
+				// 如果像现在这样实现的话，会导致 commitIndex 一直是最小的 slave commit 号，\
+				// 但实际上最小的那个 slave 可能已经挂了。
 				var committed int32
 				committed = 99999
 				for i, _ := range rf.MatchIndex {
 					if i != rf.me {
-						fmt.Println("服务器 ", i, " 的匹配上的目录是", atomic.LoadInt32(&rf.MatchIndex[i]))
+						logger.Error("服务器 ", i, " 的匹配上的目录是", atomic.LoadInt32(&rf.MatchIndex[i]))
 						committed = Int32Min(committed, atomic.LoadInt32(&rf.MatchIndex[i]))
 					}
 				}
-				rf.CommitIndex = Int32Min(committed, rf.CommitIndex+1)
-				logger.Error(rf.me, " 提交日志 ", rf.CommitIndex, ApplyMsg{
-					CommandValid: true,
-					CommandIndex: int(rf.CommitIndex),
-					Command:      rf.Logs[rf.CommitIndex].Command,
-				})
+				atomic.StoreInt32(&rf.CommitIndex, Int32Min(committed, atomic.LoadInt32(&rf.CommitIndex)+1))
+				//logger.Error(rf.me, " 提交日志 ", rf.CommitIndex, ApplyMsg{
+				//	CommandValid: true,
+				//	CommandIndex: int(rf.CommitIndex),
+				//	Command:      rf.Logs[rf.CommitIndex].Command,
+				//})
+
+				logger.Error(rf.me, " 提交日志 ")
+				rf.mu.Lock()
 				*rf.ApplyM <- ApplyMsg{
 					CommandValid: true,
 					CommandIndex: int(rf.CommitIndex),
-					Command:      rf.Logs[rf.CommitIndex].Command,
+					Command:      rf.Logs[rf.CommitIndex].Command, // todo：此处会出现 rf.CommitIndex 越界的情况
 				}
+				rf.mu.Unlock()
 
 			}
 		case <-ctx.Done():
