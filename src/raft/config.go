@@ -177,7 +177,7 @@ func (cfg *config) start1(i int) {
 				for j := 0; j < len(cfg.logs); j++ {
 					if old, oldok := cfg.logs[j][m.CommandIndex]; oldok && old != v {
 						// some server has already committed a different value for this entry!
-						err_msg = fmt.Sprintf("commit index=%v server=%v %v != server=%v %v",
+						err_msg = fmt.Sprintf("当前log的commitIndex是=%v 是%v发起commit的，具体内容是%v；但已经有%v提交了%v",
 							m.CommandIndex, i, m.Command, j, old)
 					}
 				}
@@ -455,7 +455,6 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 			t1 := time.Now()
 			for time.Since(t1).Seconds() < 2 {
 				nd, cmd1 := cfg.nCommitted(index)
-				//fmt.Println("position ", index, "has committed ", nd, "logs: ", cmd1, "正确的log是：", cmd, "希望有 ", expectedServers, " 个服务器 commit")
 				if nd > 0 && nd >= expectedServers {
 					// committed
 					if cmd1 == cmd {
@@ -465,6 +464,8 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 				}
 				time.Sleep(20 * time.Millisecond)
 			}
+			nd, cmd1 := cfg.nCommitted(index)
+			fmt.Println("position ", index, "has committed ", nd, "logs: ", cmd1, "正确的log是：", cmd, "希望有 ", expectedServers, " 个服务器 commit")
 			if retry == false {
 				cfg.t.Fatalf("one(%v) failed to reach agreement", cmd)
 			}

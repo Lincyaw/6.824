@@ -239,6 +239,7 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.voteLock.Lock()
 	defer rf.voteLock.Unlock()
+	// 加载 currentTerm, lastLogTerm, lastLogIndex
 	term := atomic.LoadInt32(&rf.CurrentTerm)
 	rf.mu.Lock()
 	var lastLogTerm, lastLogIndex int32 = 0, int32(len(rf.Logs))
@@ -250,15 +251,17 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if term > args.Term {
 		reply.VoteGranted = false
 		reply.Term = term
+		atomic.StoreInt32(&rf.VoteFor, -1)
 		return
 	}
 	// 收到的 rpc 里的 term 比自己的大，因此将状态转为跟随者
 	atomic.StoreInt32(&rf.CurrentState, FOLLOWER)
 
-	if rf.VoteFor == args.CandidateId || rf.VoteFor == -1 {
+	if atomic.LoadInt32(&rf.VoteFor) == args.CandidateId || atomic.LoadInt32(&rf.VoteFor) == -1 {
 		if args.LastLogTerm > lastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex) {
 			reply.VoteGranted = true
 			reply.Term = args.Term
+			atomic.StoreInt32(&rf.VoteFor, args.CandidateId)
 			atomic.StoreInt32(&rf.CurrentTerm, args.Term)
 			logger.Trace(rf.me, " 收到了 ", args.CandidateId, " 的选举请求, 同意")
 
@@ -270,6 +273,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	reply.VoteGranted = false
 	reply.Term = args.Term
+	atomic.StoreInt32(&rf.VoteFor, -1)
 	logger.Trace(rf.me, " 收到了 ", args.CandidateId, " 的选举请求, 并且不同意")
 }
 
@@ -351,11 +355,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if args.LeaderCommit > atomic.LoadInt32(&rf.CommitIndex) && len(rf.Logs) > 0 && args.LeaderCommit >= 0 {
 			rf.CommitIndex = Int32Min(args.LeaderCommit, int32(len(rf.Logs)-1))
 			reply.LastCommitIndex = rf.CommitIndex
-			logger.Error(rf.me, "在收到心跳时，提交日志", args.LeaderCommit)
-			*rf.ApplyM <- ApplyMsg{
-				CommandValid: true,
-				Command:      rf.Logs[rf.CommitIndex].Command,
-				CommandIndex: int(rf.CommitIndex),
+			// 如果不等于，则说明 commitIndex == len(rf.Logs)-1) < args.LeaderCommit
+			// 则master已
+			if rf.CommitIndex == args.LeaderCommit {
+				logger.Error(rf.me, "在收到心跳时，提交日志", args.LeaderCommit)
+				*rf.ApplyM <- ApplyMsg{
+					CommandValid: true,
+					Command:      rf.Logs[rf.CommitIndex].Command,
+					CommandIndex: int(rf.CommitIndex),
+				}
 			}
 		}
 
@@ -396,8 +404,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	rf.mu.Unlock()
 
-	//logger.Error(rf.me, " 接受日志，本地日志为:", rf.Logs)
-	logger.Error(rf.me, " 接受日志")
+	logger.Error(rf.me, " 接受日志，本地日志为:", rf.Logs)
+	//logger.Error(rf.me, " 接受日志")
 	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
 	// todo: 实现逻辑有错误
 	//rf.CommitIndex = int32(len(rf.Logs) - 1)
@@ -442,8 +450,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	defer rf.mu.Unlock()
 
 	rf.Logs = append(rf.Logs, newLog)
-	//logger.Error(rf.me, " 收到 command, 本地 log: ", rf.Logs)
-	logger.Error(rf.me, " 收到 command， 日志长度为 ",len(rf.Logs))
+	logger.Error(rf.me, " 收到 command, 本地 log: ", rf.Logs)
+	//logger.Error(rf.me, " 收到 command， 日志长度为 ",len(rf.Logs))
 	for i := 0; i < len(rf.peers); i++ {
 		atomic.StoreInt32(&rf.NextIndex[i], int32(len(rf.Logs)-1))
 	}
@@ -499,7 +507,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.CurrentTerm = 0
 	rf.CurrentState = FOLLOWER
 	rf.CommitIndex = -1
-	rf.VoteFor = -1
+	atomic.StoreInt32(&rf.VoteFor, -1)
 	rf.NextIndex = make([]int32, len(peers))
 	rf.MatchIndex = make([]int32, len(peers))
 	for i := range rf.MatchIndex {
@@ -556,7 +564,8 @@ func (rf *Raft) startVote(ctx context.Context) {
 
 			// 自己给自己投票
 			cnt := 1
-			//rf.VoteFor = rf.me
+			logger.Trace(rf.me, "给自己投了一票")
+			atomic.StoreInt32(&rf.VoteFor, int32(rf.me))
 			rf.mu.Lock()
 			args := RequestVoteArgs{
 				CandidateId:  int32(rf.me),
@@ -569,7 +578,7 @@ func (rf *Raft) startVote(ctx context.Context) {
 			rf.mu.Unlock()
 			// 在这里发起一次选举，向所有的 server 发送选举请求
 			reps := make(chan RequestVoteReply, len(rf.peers))
-			chanLock := sync.Mutex {}
+			chanLock := sync.Mutex{}
 			for idx, server := range rf.peers {
 				if idx != rf.me {
 					idx := idx
@@ -668,7 +677,6 @@ func (rf *Raft) sendHearBeatsClock(ctx context.Context) {
 				LeaderId:     int32(rf.me),
 				LeaderCommit: rf.CommitIndex,
 			}
-			replies := make([]AppendEntriesReply, len(rf.peers))
 			var noReplyNumber, commitNumber int32 = 0, 0
 			for idx, server := range rf.peers {
 				idx := idx
@@ -689,7 +697,8 @@ func (rf *Raft) sendHearBeatsClock(ctx context.Context) {
 						}
 						rf.mu.Unlock()
 						var once sync.Once
-						for !server.Call("Raft.AppendEntries", &args, &(replies[idx])) {
+						reply := AppendEntriesReply{}
+						for !server.Call("Raft.AppendEntries", &args, &reply) {
 							once.Do(func() {
 								atomic.AddInt32(&noReplyNumber, 1)
 							})
@@ -699,14 +708,14 @@ func (rf *Raft) sendHearBeatsClock(ctx context.Context) {
 							}
 						}
 						// 处理心跳的情况
-						if replies[idx].Term > term {
+						if reply.Term > term {
 							// 收到的 CurrentTerm 比自己的大
-							atomic.StoreInt32(&rf.CurrentTerm, replies[idx].Term)
+							atomic.StoreInt32(&rf.CurrentTerm, reply.Term)
 							atomic.StoreInt32(&rf.CurrentState, FOLLOWER)
 							return
 						}
 						// 此处的 false 只可能是 log 对不上
-						if len(args.Entries) != 0 && replies[idx].Success == false {
+						if len(args.Entries) != 0 && reply.Success == false {
 							logger.Error("log 对不上")
 							// todo: 可优化
 							atomic.StoreInt32(&rf.MatchIndex[idx], Int32Max(atomic.LoadInt32(&rf.MatchIndex[idx])-1, -1))
@@ -716,9 +725,9 @@ func (rf *Raft) sendHearBeatsClock(ctx context.Context) {
 						}
 						// 采用累积重传
 						if len(args.Entries) != 0 {
-							logger.Error(idx, " 已经成功 commit ", replies[idx].LastCommitIndex)
+							logger.Error(idx, " 已经成功 commit ", reply.LastCommitIndex)
 							atomic.AddInt32(&commitNumber, 1)
-							atomic.StoreInt32(&rf.MatchIndex[idx], replies[idx].LastCommitIndex)
+							atomic.StoreInt32(&rf.MatchIndex[idx], reply.LastCommitIndex)
 						}
 					}()
 				}
@@ -736,12 +745,18 @@ func (rf *Raft) sendHearBeatsClock(ctx context.Context) {
 				// todo: 潜在的bug。此处应该统计超过半数的 commitindex 。 \
 				// 如果像现在这样实现的话，会导致 commitIndex 一直是最小的 slave commit 号，\
 				// 但实际上最小的那个 slave 可能已经挂了。
-				var committed int32
-				committed = 99999
-				for i:= range rf.MatchIndex {
+				var committed, cnt int32
+				for i := range rf.MatchIndex {
 					if i != rf.me {
 						logger.Error("服务器 ", i, " 的匹配上的目录是", atomic.LoadInt32(&rf.MatchIndex[i]))
-						committed = Int32Min(committed, atomic.LoadInt32(&rf.MatchIndex[i]))
+						if cnt == 0 {
+							committed = rf.MatchIndex[i]
+						}
+						if rf.MatchIndex[i] == committed {
+							cnt++
+						} else {
+							cnt--
+						}
 					}
 				}
 				atomic.StoreInt32(&rf.CommitIndex, Int32Min(committed, atomic.LoadInt32(&rf.CommitIndex)+1))
