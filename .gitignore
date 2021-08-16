@@ -2,7 +2,7 @@ pkg/
 api.key
 *-handin.tar.gz
 src/main/mr-*
-.idea
-.vscode
+.idea/
+.vscode/
 src/raft/logs
 src/raft/test_logs

@@ -72,6 +72,11 @@ const (
 	LEADER    int32 = 3
 )
 
+type voteMsg struct {
+	who  int32
+	term int32
+}
+
 // Raft
 // A Go object implementing a single Raft peer.
 //
@@ -89,8 +94,8 @@ type Raft struct {
 	// state a Raft server must maintain.
 
 	// Persistent state
-	CurrentTerm int32 // 当前的任期
-	VoteFor     int32 //candidateId that received vote in current term (or null if none)
+	CurrentTerm int32        // 当前的任期
+	VoteFor     atomic.Value //candidateId that received vote in current term (or null if none)
 	Logs        []Log
 
 	// Volatile state
@@ -248,33 +253,47 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	rf.mu.Unlock()
 
-	if term > args.Term {
+	//  Reply false if term < currentTerm
+	if args.Term < term {
 		reply.VoteGranted = false
 		reply.Term = term
-		atomic.StoreInt32(&rf.VoteFor, -1)
 		return
 	}
 	// 收到的 rpc 里的 term 比自己的大，因此将状态转为跟随者
 	atomic.StoreInt32(&rf.CurrentState, FOLLOWER)
+	// 收到选举请求后，需要抑制自己进行选举，否则可能导致不断地发起选举
+	rf.VoteTimeOutTicker.Reset(time.Duration(rf.VoteTime) * time.Millisecond)
 
-	if atomic.LoadInt32(&rf.VoteFor) == args.CandidateId || atomic.LoadInt32(&rf.VoteFor) == -1 {
-		if args.LastLogTerm > lastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex) {
+	v := rf.VoteFor.Load().(voteMsg)
+	//  If votedFor is null or candidateId
+	logger.Errorf("%v 收到 %v 的选举信息， LastLogIndex=%v, LastLogTerm=%v, Term=%v. 自己的 vote 信息为：who=%v, term=%v", rf.me, args.CandidateId, args.LastLogIndex, args.LastLogTerm, args.Term, v.who, v.term)
+		// candidate’s log is at least as up-to-date as receiver’s log, grant vote
+	if args.LastLogTerm > lastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex) {
+		target := rf.updateVoteFor(voteMsg{
+			who:  args.CandidateId,
+			term: args.Term,
+		})
+		if target == int(args.CandidateId) {
 			reply.VoteGranted = true
 			reply.Term = args.Term
-			atomic.StoreInt32(&rf.VoteFor, args.CandidateId)
 			atomic.StoreInt32(&rf.CurrentTerm, args.Term)
 			logger.Trace(rf.me, " 收到了 ", args.CandidateId, " 的选举请求, 同意")
-
-			// 收到选举请求后，需要抑制自己进行选举，否则可能导致不断地发起选举
-			rf.VoteTimeOutTicker.Reset(time.Duration(rf.VoteTime) * time.Millisecond)
 			return
 		}
 	}
 
 	reply.VoteGranted = false
 	reply.Term = args.Term
-	atomic.StoreInt32(&rf.VoteFor, -1)
 	logger.Trace(rf.me, " 收到了 ", args.CandidateId, " 的选举请求, 并且不同意")
+}
+
+func (rf *Raft) updateVoteFor(new voteMsg) int {
+	pre := rf.VoteFor.Load().(voteMsg)
+	if pre.term >= new.term {
+		return int(pre.who)
+	}
+	rf.VoteFor.Store(new)
+	return int(new.who)
 }
 
 //
@@ -342,7 +361,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 下面三行不管是心跳还是日志，都会执行
 	atomic.StoreInt32(&rf.CurrentTerm, args.Term)
 	atomic.StoreInt32(&rf.CurrentState, FOLLOWER)
-	reply.Term = args.Term
 
 	// 心跳：自己的任期号比发来的心跳的小
 	if len(args.Entries) == 0 {
@@ -507,14 +525,17 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.CurrentTerm = 0
 	rf.CurrentState = FOLLOWER
 	rf.CommitIndex = -1
-	atomic.StoreInt32(&rf.VoteFor, -1)
+	rf.VoteFor.Store(voteMsg{
+		who:  -1,
+		term: -1,
+	})
 	rf.NextIndex = make([]int32, len(peers))
 	rf.MatchIndex = make([]int32, len(peers))
 	for i := range rf.MatchIndex {
 		rf.MatchIndex[i] = -1
 	}
-	rf.HeartBeatCheck = 220
-	rf.HeartBeatSend = 105
+	rf.HeartBeatCheck = 230 + rand.Intn(150)
+	rf.HeartBeatSend = 105 + rand.Intn(50)
 	rf.VoteTime = rand.Intn(150) + 150
 
 	rf.VoteTimeOutTicker = time.NewTicker(time.Duration(rf.VoteTime))
@@ -563,9 +584,17 @@ func (rf *Raft) startVote(ctx context.Context) {
 			logger.Debug("id ", rf.me, " 开始选举,自己的任期为 ", term)
 
 			// 自己给自己投票
-			cnt := 1
-			logger.Trace(rf.me, "给自己投了一票")
-			atomic.StoreInt32(&rf.VoteFor, int32(rf.me))
+			var cnt int
+			if rf.updateVoteFor(voteMsg{
+				who:  int32(rf.me),
+				term: term,
+			}) == rf.me {
+				cnt = 1
+				logger.Trace(rf.me, "给自己投了一票")
+			} else {
+				logger.Trace(rf.me, "不能给自己投票，因为他在任期 ", term, " 里，已经给别人投过票了")
+				continue
+			}
 			rf.mu.Lock()
 			args := RequestVoteArgs{
 				CandidateId:  int32(rf.me),
@@ -597,7 +626,7 @@ func (rf *Raft) startVote(ctx context.Context) {
 								chanLock.Lock()
 								reps <- rep
 								chanLock.Unlock()
-								logger.Trace(rf.me, " 收到的选举回复, CurrentTerm:", rep.Term, ", Agree? ", rep.VoteGranted)
+								logger.Trace(rf.me, " 收到 ", idx, " 的选举回复, 对方的term:", rep.Term, ", 自己的term", term, "Agree? ", rep.VoteGranted)
 							}
 						}
 					}()
