@@ -16,7 +16,7 @@ if [ -f $folder/"$lab".log ];then
 fi
 echo "Test begin... Please wait~"
 
-tmplog=/tmp/tmplog
+tmplog=/tmp/tmplog.$(date "+%Y%m%d%H%M%S")
 cnt=1
 # shellcheck disable=SC2034
 for i in $(seq "$inter")

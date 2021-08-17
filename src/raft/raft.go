@@ -267,7 +267,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	v := rf.VoteFor.Load().(voteMsg)
 	//  If votedFor is null or candidateId
 	logger.Errorf("%v 收到 %v 的选举信息， LastLogIndex=%v, LastLogTerm=%v, Term=%v. 自己的 vote 信息为：who=%v, term=%v", rf.me, args.CandidateId, args.LastLogIndex, args.LastLogTerm, args.Term, v.who, v.term)
-		// candidate’s log is at least as up-to-date as receiver’s log, grant vote
+	// candidate’s log is at least as up-to-date as receiver’s log, grant vote
 	if args.LastLogTerm > lastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex) {
 		target := rf.updateVoteFor(voteMsg{
 			who:  args.CandidateId,
@@ -349,7 +349,6 @@ type AppendEntriesReply struct {
 // AppendEntries 心跳通知、日志追加 RPC
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	term := atomic.LoadInt32(&rf.CurrentTerm)
-	logger.Trace(rf.me, " 收到 id ", args.LeaderId, "的心跳请求，其任期为 ", args.Term, " 自己的任期为 ", term)
 
 	// 自己的任期号比发来的心跳的大 §5.1
 	if args.Term < term {
@@ -364,24 +363,32 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// 心跳：自己的任期号比发来的心跳的小
 	if len(args.Entries) == 0 {
+		logger.Trace(rf.me, " 收到 id ", args.LeaderId, "的心跳请求，其任期为 ", args.Term, " 自己的任期为 ", term)
+
 		reply.Success = true
 		// 收到心跳后，应该抑制其变为 candidate, 并且抑制其发起选举
 		rf.HeartBeatTimeOutTicker.Reset(time.Duration(rf.HeartBeatCheck) * time.Millisecond)
 		rf.VoteTimeOutTicker.Reset(time.Duration(rf.VoteTime) * time.Millisecond)
 
+		logger.Errorf("LeaderCommit=%v, 自己的 CommitIndex=%v", args.LeaderCommit, atomic.LoadInt32(&rf.CommitIndex))
+
 		// 到底是在什么时候 apply 呢？ 在收到心跳的时候， master可以发送一个 commitIndex，让slave检测log是否正确commit
 		if args.LeaderCommit > atomic.LoadInt32(&rf.CommitIndex) && len(rf.Logs) > 0 && args.LeaderCommit >= 0 {
+			//pre := Int32Max(rf.CommitIndex, 0)+1
 			rf.CommitIndex = Int32Min(args.LeaderCommit, int32(len(rf.Logs)-1))
 			reply.LastCommitIndex = rf.CommitIndex
 			// 如果不等于，则说明 commitIndex == len(rf.Logs)-1) < args.LeaderCommit
-			// 则master已
 			if rf.CommitIndex == args.LeaderCommit {
 				logger.Error(rf.me, "在收到心跳时，提交日志", args.LeaderCommit)
+				//for pre <= rf.CommitIndex {
 				*rf.ApplyM <- ApplyMsg{
 					CommandValid: true,
 					Command:      rf.Logs[rf.CommitIndex].Command,
 					CommandIndex: int(rf.CommitIndex),
 				}
+				//pre++
+				//}
+
 			}
 		}
 
@@ -425,11 +432,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	logger.Error(rf.me, " 接受日志，本地日志为:", rf.Logs)
 	//logger.Error(rf.me, " 接受日志")
 	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
-	// todo: 实现逻辑有错误
-	//rf.CommitIndex = int32(len(rf.Logs) - 1)
-	//if args.LeaderCommit > rf.CommitIndex {
-	//	rf.CommitIndex = Int32Min(args.LeaderCommit, rf.CommitIndex)
-	//}
+
+	// 表示 follower 已经有的日志 index
 	reply.LastCommitIndex = int32(len(rf.Logs) - 1)
 	reply.Success = true
 }
@@ -468,7 +472,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	defer rf.mu.Unlock()
 
 	rf.Logs = append(rf.Logs, newLog)
-	logger.Error(rf.me, " 收到 command, 本地 log: ", rf.Logs)
+	logger.Error(rf.me, " 收到 command", newLog, ", 本地 log: ", rf.Logs)
 	//logger.Error(rf.me, " 收到 command， 日志长度为 ",len(rf.Logs))
 	for i := 0; i < len(rf.peers); i++ {
 		atomic.StoreInt32(&rf.NextIndex[i], int32(len(rf.Logs)-1))
@@ -534,7 +538,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	for i := range rf.MatchIndex {
 		rf.MatchIndex[i] = -1
 	}
-	rf.HeartBeatCheck = 230 + rand.Intn(150)
+	rf.HeartBeatCheck = 220 + rand.Intn(50)
 	rf.HeartBeatSend = 105 + rand.Intn(50)
 	rf.VoteTime = rand.Intn(150) + 150
 
@@ -771,21 +775,20 @@ func (rf *Raft) sendHearBeatsClock(ctx context.Context) {
 			}
 			if atomic.LoadInt32(&commitNumber) >= int32(len(rf.peers)/2) {
 				// 超过半数回复了
-				// todo: 潜在的bug。此处应该统计超过半数的 commitindex 。 \
-				// 如果像现在这样实现的话，会导致 commitIndex 一直是最小的 slave commit 号，\
-				// 但实际上最小的那个 slave 可能已经挂了。
+				// todo: 此处应该统计超过半数的 commitindex 。
+				// 摩尔投票法获取 matchIndex 的众数
 				var committed, cnt int32
+				rf.MatchIndex[rf.me] = rf.CommitIndex + 1
 				for i := range rf.MatchIndex {
-					if i != rf.me {
-						logger.Error("服务器 ", i, " 的匹配上的目录是", atomic.LoadInt32(&rf.MatchIndex[i]))
-						if cnt == 0 {
-							committed = rf.MatchIndex[i]
-						}
-						if rf.MatchIndex[i] == committed {
-							cnt++
-						} else {
-							cnt--
-						}
+					logger.Error("服务器 ", i, " 的匹配上的目录是", atomic.LoadInt32(&rf.MatchIndex[i]))
+					if cnt == 0 {
+						committed = rf.MatchIndex[i]
+						logger.Error("committed: ", committed)
+					}
+					if rf.MatchIndex[i] == committed {
+						cnt++
+					} else {
+						cnt--
 					}
 				}
 				atomic.StoreInt32(&rf.CommitIndex, Int32Min(committed, atomic.LoadInt32(&rf.CommitIndex)+1))
@@ -795,7 +798,7 @@ func (rf *Raft) sendHearBeatsClock(ctx context.Context) {
 				//	Command:      rf.Logs[rf.CommitIndex].Command,
 				//})
 
-				logger.Error(rf.me, " 提交日志 ")
+				logger.Error("所有的matchIndex为", rf.MatchIndex, " ,", rf.me, " 的 commitIndex 是", rf.CommitIndex, ", ", committed, " , 提交了日志。本地日志为：", rf.Logs)
 				rf.mu.Lock()
 				*rf.ApplyM <- ApplyMsg{
 					CommandValid: true,

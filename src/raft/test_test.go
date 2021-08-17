@@ -220,7 +220,7 @@ func TestFailNoAgree2B(t *testing.T) {
 	if ok != true {
 		t.Fatalf("leader rejected Start()")
 	}
-	if index != 2 {
+	if index+1 != 2 {
 		t.Fatalf("expected index 2, got %v", index)
 	}
 
