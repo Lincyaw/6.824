@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -43,7 +44,7 @@ func init() {
 	} else {
 		logger.Info("Failed to log to file, using default stderr")
 	}
-	logger.SetLevel(logrus.TraceLevel)
+	logger.SetLevel(logrus.ErrorLevel)
 }
 
 // import "bytes"
@@ -130,6 +131,14 @@ func (rf *Raft) String() string {
 	}
 	return out.String()
 }
+
+// 为以后统一加锁解锁做准备,  只是切换到这样的一个大锁后,性能可能会降低
+func (rf *Raft) get(name string) interface{} {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return reflect.ValueOf(&rf).FieldByName(name).Interface()
+}
+
 
 //
 //func (r *RequestVoteArgs) String() string {
@@ -259,16 +268,17 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.Term = term
 		return
 	}
-	// 收到的 rpc 里的 term 比自己的大，因此将状态转为跟随者
-	atomic.StoreInt32(&rf.CurrentState, FOLLOWER)
-	// 收到选举请求后，需要抑制自己进行选举，否则可能导致不断地发起选举
-	rf.VoteTimeOutTicker.Reset(time.Duration(rf.VoteTime) * time.Millisecond)
+
 
 	v := rf.VoteFor.Load().(voteMsg)
 	//  If votedFor is null or candidateId
 	logger.Errorf("%v 收到 %v 的选举信息， LastLogIndex=%v, LastLogTerm=%v, Term=%v. 自己的 vote 信息为：who=%v, term=%v", rf.me, args.CandidateId, args.LastLogIndex, args.LastLogTerm, args.Term, v.who, v.term)
 	// candidate’s log is at least as up-to-date as receiver’s log, grant vote
 	if args.LastLogTerm > lastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex) {
+		// 收到的 rpc 里的 term 比自己的大，因此将状态转为跟随者
+		atomic.StoreInt32(&rf.CurrentState, FOLLOWER)
+		// 收到选举请求后，需要抑制自己进行选举，否则可能导致不断地发起选举
+		rf.VoteTimeOutTicker.Reset(time.Duration(rf.VoteTime) * time.Millisecond)
 		target := rf.updateVoteFor(voteMsg{
 			who:  args.CandidateId,
 			term: args.Term,
@@ -370,24 +380,24 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.HeartBeatTimeOutTicker.Reset(time.Duration(rf.HeartBeatCheck) * time.Millisecond)
 		rf.VoteTimeOutTicker.Reset(time.Duration(rf.VoteTime) * time.Millisecond)
 
-		logger.Errorf("LeaderCommit=%v, 自己的 CommitIndex=%v", args.LeaderCommit, atomic.LoadInt32(&rf.CommitIndex))
+		logger.Errorf("AppendEntries: LeaderCommit=%v, %v的CommitIndex=%v", args.LeaderCommit,rf.me ,atomic.LoadInt32(&rf.CommitIndex))
 
 		// 到底是在什么时候 apply 呢？ 在收到心跳的时候， master可以发送一个 commitIndex，让slave检测log是否正确commit
 		if args.LeaderCommit > atomic.LoadInt32(&rf.CommitIndex) && len(rf.Logs) > 0 && args.LeaderCommit >= 0 {
-			//pre := Int32Max(rf.CommitIndex, 0)+1
+			pre := Int32Max(rf.CommitIndex, 0)
 			rf.CommitIndex = Int32Min(args.LeaderCommit, int32(len(rf.Logs)-1))
 			reply.LastCommitIndex = rf.CommitIndex
 			// 如果不等于，则说明 commitIndex == len(rf.Logs)-1) < args.LeaderCommit
 			if rf.CommitIndex == args.LeaderCommit {
 				logger.Error(rf.me, "在收到心跳时，提交日志", args.LeaderCommit)
-				//for pre <= rf.CommitIndex {
+				for pre <= rf.CommitIndex {
 				*rf.ApplyM <- ApplyMsg{
 					CommandValid: true,
-					Command:      rf.Logs[rf.CommitIndex].Command,
-					CommandIndex: int(rf.CommitIndex),
+					Command:      rf.Logs[pre].Command,
+					CommandIndex: int(pre),
 				}
-				//pre++
-				//}
+				pre++
+				}
 
 			}
 		}
@@ -473,10 +483,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	rf.Logs = append(rf.Logs, newLog)
 	logger.Error(rf.me, " 收到 command", newLog, ", 本地 log: ", rf.Logs)
-	//logger.Error(rf.me, " 收到 command， 日志长度为 ",len(rf.Logs))
-	for i := 0; i < len(rf.peers); i++ {
-		atomic.StoreInt32(&rf.NextIndex[i], int32(len(rf.Logs)-1))
-	}
+	logger.Error(rf.me, " 收到 command， 日志长度为 ",len(rf.Logs))
+	//for i := 0; i < len(rf.peers); i++ {
+	//	atomic.StoreInt32(&rf.NextIndex[i], int32(len(rf.Logs)))
+	//}
 	index = len(rf.Logs) - 1
 
 	return index, int(term), isLeader
@@ -720,10 +730,13 @@ func (rf *Raft) sendHearBeatsClock(ctx context.Context) {
 					start:
 						// 向 follower 发送其没有的日志
 						rf.mu.Lock()
-						if atomic.LoadInt32(&rf.NextIndex[idx]) <= int32(len(rf.Logs)-1) {
+						if atomic.LoadInt32(&rf.NextIndex[idx]) <= int32(len(rf.Logs)-1) && len(rf.Logs)>0{
+							// todo, 应该是nextINdex
 							args.Entries = rf.Logs[atomic.LoadInt32(&rf.NextIndex[idx]):]
-							args.PrevLogIndex = atomic.LoadInt32(&rf.MatchIndex[idx])
-							args.PrevLogTerm = rf.Logs[args.PrevLogIndex].Term
+							args.PrevLogIndex = atomic.LoadInt32(&rf.NextIndex[idx])-1
+							if args.PrevLogIndex >= 0{
+								args.PrevLogTerm = rf.Logs[args.PrevLogIndex].Term
+							}
 							//logger.Error("rf.MatchIndex[idx]: ", args.PrevLogIndex, " term: ", args.PrevLogTerm, ", ", rf.me, "向", idx, "心跳附加", rf.NextIndex[idx], "及其之后的日志：", args.Entries)
 							logger.Error("rf.MatchIndex[idx]: ", args.PrevLogIndex, " term: ", args.PrevLogTerm, ", ", rf.me, "向", idx, "心跳附加", rf.NextIndex[idx])
 							rf.NextIndex[idx]++
@@ -778,14 +791,14 @@ func (rf *Raft) sendHearBeatsClock(ctx context.Context) {
 				// todo: 此处应该统计超过半数的 commitindex 。
 				// 摩尔投票法获取 matchIndex 的众数
 				var committed, cnt int32
-				rf.MatchIndex[rf.me] = rf.CommitIndex + 1
+				atomic.StoreInt32(&rf.MatchIndex[rf.me],rf.CommitIndex + 1)
 				for i := range rf.MatchIndex {
 					logger.Error("服务器 ", i, " 的匹配上的目录是", atomic.LoadInt32(&rf.MatchIndex[i]))
 					if cnt == 0 {
-						committed = rf.MatchIndex[i]
+						committed = atomic.LoadInt32(& rf.MatchIndex[i])
 						logger.Error("committed: ", committed)
 					}
-					if rf.MatchIndex[i] == committed {
+					if atomic.LoadInt32(& rf.MatchIndex[i]) == committed {
 						cnt++
 					} else {
 						cnt--
@@ -798,7 +811,7 @@ func (rf *Raft) sendHearBeatsClock(ctx context.Context) {
 				//	Command:      rf.Logs[rf.CommitIndex].Command,
 				//})
 
-				logger.Error("所有的matchIndex为", rf.MatchIndex, " ,", rf.me, " 的 commitIndex 是", rf.CommitIndex, ", ", committed, " , 提交了日志。本地日志为：", rf.Logs)
+				//logger.Error("所有的matchIndex为", rf.MatchIndex, " ,", rf.me, " 的 commitIndex 是", rf.CommitIndex, ", ", committed, " , 提交了日志。本地日志为：", rf.Logs)
 				rf.mu.Lock()
 				*rf.ApplyM <- ApplyMsg{
 					CommandValid: true,
